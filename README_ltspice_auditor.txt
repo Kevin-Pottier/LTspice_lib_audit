@@ -3,11 +3,10 @@ LTspice Library Auditor - mode d'emploi rapide
 
 1) Installe Python 3.10+ sur Windows.
 
-2) Place le script ou tu veux, par exemple :
-   C:\Users\kpottier\Desktop\ltspice_lib_auditor.py
+2) Place le script ou tu veux 
 
 3) Exemple de lancement simple (parallelisme auto = nb_coeurs - 1) :
-   python ltspice_lib_auditor.py --root "C:\Users\kpottier\AppData\Local\LTspice\lib\thirdparty\bordodynov" --out "C:\Temp\lt_audit"
+   python ltspice_lib_auditor.py --root "{PATH_TO_LIB}" --out "C:\Temp\lt_audit"
 
 4) Si LTspice n'est pas detecte automatiquement :
    python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --ltspice "C:\Program Files\ADI\LTspice\LTspice.exe"
