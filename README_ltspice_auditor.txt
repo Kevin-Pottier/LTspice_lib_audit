@@ -3,20 +3,38 @@ LTspice Library Auditor - mode d'emploi rapide
 
 1) Installe Python 3.10+ sur Windows.
 
-2) Place le script où tu veux, par exemple :
+2) Place le script ou tu veux, par exemple :
    C:\Users\kpottier\Desktop\ltspice_lib_auditor.py
 
-3) Exemple de lancement simple :
+3) Exemple de lancement simple (parallelisme auto = nb_coeurs - 1) :
    python ltspice_lib_auditor.py --root "C:\Users\kpottier\AppData\Local\LTspice\lib\thirdparty\bordodynov" --out "C:\Temp\lt_audit"
 
-4) Si LTspice n'est pas détecté automatiquement :
-   python ltspice_lib_auditor.py --root "C:\Users\kpottier\AppData\Local\LTspice\lib\thirdparty\bordodynov" --out "C:\Temp\lt_audit" --ltspice "C:\Program Files\ADI\LTspice\LTspice.exe"
+4) Si LTspice n'est pas detecte automatiquement :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --ltspice "C:\Program Files\ADI\LTspice\LTspice.exe"
 
-5) Si tu veux seulement générer les decks et les commandes :
-   python ltspice_lib_auditor.py --root "C:\Users\kpottier\AppData\Local\LTspice\lib\thirdparty\bordodynov" --out "C:\Temp\lt_audit" --no-batch
+5) Forcer 8 workers paralleles et un timeout court :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" -j 8 --timeout 10
 
-6) Si tu veux tester seulement les fichiers suspects :
-   python ltspice_lib_auditor.py --root "C:\Users\kpottier\AppData\Local\LTspice\lib\thirdparty\bordodynov" --out "C:\Temp\lt_audit" --only-suspect
+6) Si tu veux seulement generer les decks et les commandes (pas de run LTspice) :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --no-batch
+
+7) Tester seulement les fichiers suspects (le plus rentable en perf) :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --only-suspect
+
+8) Sauter aussi les fichiers deja juges casses au prescan :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --skip-broken-batch
+
+9) Forcer un rescan complet sans utiliser le cache :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --no-cache
+
+Options principales :
+- -j N / --jobs N        : nb de processus paralleles (defaut auto = cpu-1)
+- --timeout N            : timeout LTspice en secondes (defaut 15)
+- --no-cache             : ignore + n'ecrit pas le cache .audit_cache.json
+- --keep-raw             : conserve les .raw / .net (par defaut supprimes)
+- --only-suspect         : batch limite aux SUSPECT/BROKEN_LIKELY/READ_ERROR
+- --skip-broken-batch    : saute les BROKEN_LIKELY/READ_ERROR au batch
+- --max-files / --max-subckts : limites pour tester rapidement
 
 Sorties importantes :
 - reports/files_summary.csv
@@ -26,12 +44,23 @@ Sorties importantes :
 - reports/batch_commands.csv
 - reports/batch_results.csv
 - README_AUDIT.txt
+- .audit_cache.json   (cache : evite de retester ce qui n'a pas bouge)
 
-Interprétation :
+Interpretation :
 - LIKELY_OK      : rien de grave vu au prescan
 - SUSPECT        : des motifs douteux existent
-- BROKEN_LIKELY  : très forte probabilité d'erreur structurelle
-- FAIL_SYNTAX    : LTspice a rencontré une erreur de syntaxe
-- FAIL_INCLUDE   : dépendance manquante
+- BROKEN_LIKELY  : tres forte probabilite d'erreur structurelle
+- FAIL_SYNTAX    : LTspice a rencontre une erreur de syntaxe
+- FAIL_INCLUDE   : dependance manquante
 - FAIL_SUBCKT    : sous-circuit non instanciable
-- FAIL_PINCOUNT  : problème de nombre de broches
+- FAIL_PINCOUNT  : probleme de nombre de broches
+- TIMEOUT        : LTspice n'a pas rendu la main dans --timeout secondes
+- EXEC_ERROR     : echec de lancement du process
+
+Performance :
+- Le cache est indexe par hash de fichier : un 2eme run ne refait que les
+  fichiers modifies depuis le run precedent.
+- En cas de crash / Ctrl+C, le cache est sauvegarde periodiquement, donc
+  relancer la meme commande reprend la ou ca s'est arrete.
+- Combiner -j (parallelisme) + --timeout court + --only-suspect donne en
+  general un gain de 10-20x sur les grosses librairies.
