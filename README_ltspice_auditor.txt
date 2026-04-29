@@ -26,6 +26,9 @@ LTspice Library Auditor - mode d'emploi rapide
 9) Forcer un rescan complet sans utiliser le cache :
    python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --no-cache
 
+10) Regenerer juste le rapport HTML depuis les CSV existants (sans re-auditer) :
+   python ltspice_lib_auditor.py --out "C:\Temp\lt_audit" --report-only
+
 Options principales :
 - -j N / --jobs N        : nb de processus paralleles (defaut auto = cpu-1)
 - --timeout N            : timeout LTspice en secondes (defaut 15)
@@ -34,6 +37,8 @@ Options principales :
 - --only-suspect         : batch limite aux SUSPECT/BROKEN_LIKELY/READ_ERROR
 - --skip-broken-batch    : saute les BROKEN_LIKELY/READ_ERROR au batch
 - --max-files / --max-subckts : limites pour tester rapidement
+- --no-report            : pas de rapport HTML en fin d'audit
+- --report-only          : regenere uniquement report.html depuis les CSV
 
 Sorties importantes :
 - reports/files_summary.csv
@@ -43,7 +48,17 @@ Sorties importantes :
 - reports/batch_commands.csv
 - reports/batch_results.csv
 - README_AUDIT.txt
+- report.html         (rapport interactif filtrable, ouvre dans un navigateur)
 - .audit_cache.json   (cache : evite de retester ce qui n'a pas bouge)
+
+Rapport HTML (report.html) :
+- Fichier autonome, fonctionne offline (pas de CDN)
+- Cartes de stats globales + recommandations actionnables
+- Repartition par statut (prescan + batch)
+- Top categories d'erreurs LTspice
+- Inventaire pour la reorganisation : extensions, types de .MODEL, pin counts
+- Tables triables (click sur les en-tetes) et filtrables (champ recherche)
+- Genere automatiquement a la fin de chaque audit (sauf --no-report)
 
 Interpretation :
 - LIKELY_OK      : rien de grave vu au prescan
