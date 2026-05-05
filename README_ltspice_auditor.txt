@@ -29,9 +29,19 @@ LTspice Library Auditor - mode d'emploi rapide
 10) Regenerer juste le rapport HTML depuis les CSV existants (sans re-auditer) :
    python ltspice_lib_auditor.py --out "C:\Temp\lt_audit" --report-only
 
+11) Lancer l'interface graphique :
+   python ltspice_lib_auditor.py --gui
+   (les chemins et options du dernier run sont rappeles automatiquement)
+
+12) Desactiver le groupement (test individuel par sous-circuit, plus lent mais
+    plus simple a tracer) :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --group-size 1
+
 Options principales :
 - -j N / --jobs N        : nb de processus paralleles (defaut auto = cpu-1)
 - --timeout N            : timeout LTspice en secondes (defaut 15)
+- --group-size N         : sous-circuits par deck groupe (defaut 20 ; 1 = desactive).
+                           Si un groupe echoue, fallback automatique sur tests individuels.
 - --no-cache             : ignore + n'ecrit pas le cache .audit_cache.json
 - --keep-raw             : conserve les .raw / .net (par defaut supprimes)
 - --only-suspect         : batch limite aux SUSPECT/BROKEN_LIKELY/READ_ERROR
@@ -39,6 +49,7 @@ Options principales :
 - --max-files / --max-subckts : limites pour tester rapidement
 - --no-report            : pas de rapport HTML en fin d'audit
 - --report-only          : regenere uniquement report.html depuis les CSV
+- --gui                  : lance l'interface graphique Tkinter
 
 Sorties importantes :
 - reports/files_summary.csv
@@ -76,5 +87,19 @@ Performance :
   fichiers modifies depuis le run precedent.
 - En cas de crash / Ctrl+C, le cache est sauvegarde periodiquement, donc
   relancer la meme commande reprend la ou ca s'est arrete.
-- Combiner -j (parallelisme) + --timeout court + --only-suspect donne en
-  general un gain de 10-20x sur les grosses librairies.
+- Le groupement (--group-size 20 par defaut) teste 20 sous-circuits par
+  invocation LTspice : amortit le startup process (~2-5s sur Windows). En cas
+  d'echec d'un groupe, fallback automatique sur tests individuels pour
+  identifier le coupable.
+- Combiner -j (parallelisme) + --timeout court + --only-suspect + groupement
+  donne en general un gain de 30-100x sur les grosses librairies.
+
+Interface graphique (--gui) :
+- Formulaire avec selecteurs de fichiers/dossiers
+- Cases a cocher pour toutes les options
+- Spinbox pour workers / timeout / group-size / max-*
+- Console scrollable temps reel avec coloration syntaxique
+- Barre de progression + ETA + debit (tests/min)
+- Bouton Arreter qui sauve le cache avant de tuer le process
+- Boutons "Ouvrir rapport HTML" et "Ouvrir dossier sortie"
+- Reglages persistes dans ~/.ltspice_audit_gui_settings.json

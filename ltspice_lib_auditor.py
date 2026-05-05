@@ -466,6 +466,24 @@ def build_subckt_test_deck(file_path: Path, subckt_name: str, pin_count: int) ->
     """).strip() + "\n"
 
 
+def build_subckt_group_test_deck(file_path: Path, members: List[Tuple[str, int]]) -> str:
+    """
+    Construit un deck testant N sous-circuits du meme fichier en une seule
+    invocation LTspice. Chaque XU est isole dans son propre namespace de noeuds
+    (g{i}_n{j}), donc pas de collisions entre subckts du groupe.
+    """
+    lines = ['* subckt-group test', f'.include "{file_path}"']
+    for i, (name, pin_count) in enumerate(members, start=1):
+        n_pins = max(pin_count, 1)
+        nodes = [f"g{i}_n{j}" for j in range(1, n_pins + 1)]
+        for j, node in enumerate(nodes, start=1):
+            lines.append(f"V{i}_{j} {node} 0 0")
+        lines.append(f"XU{i} {' '.join(nodes)} {name}")
+    lines.append(".op")
+    lines.append(".end")
+    return "\n".join(lines) + "\n"
+
+
 def _cleanup_ltspice_artifacts(cir_path: Path, keep_raw: bool) -> None:
     """Supprime les fichiers lourds generes a cote du .cir, garde le .log."""
     if keep_raw:
@@ -1134,6 +1152,507 @@ def generate_html_report(out_dir: Path) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
+# GUI Tkinter (lazy import : ne charge tkinter qu'en mode --gui)
+# ---------------------------------------------------------------------------
+
+GUI_SETTINGS_PATH = Path.home() / ".ltspice_audit_gui_settings.json"
+PROGRESS_RE = re.compile(r'(?:Batch[^:]*|Prescan)[^:]*:\s*(\d+)/(\d+)')
+
+
+def launch_gui() -> int:
+    try:
+        import tkinter as tk  # noqa: F401
+        from tkinter import ttk  # noqa: F401
+    except ImportError:
+        print("[ERREUR] Tkinter introuvable. Reinstalle Python avec l'option Tcl/Tk.")
+        return 2
+    app = AuditGUI()
+    app.run()
+    return 0
+
+
+class AuditGUI:
+    """Interface Tkinter qui pilote l'audit comme sous-processus."""
+
+    def __init__(self):
+        import tkinter as tk
+        from tkinter import ttk
+        import queue as _queue
+
+        self._tk = tk
+        self._ttk = ttk
+        self._q: "_queue.Queue[Optional[str]]" = _queue.Queue()
+        self.process: Optional[subprocess.Popen] = None
+        self.reader_thread = None
+        self.start_time: Optional[float] = None
+        self.last_total = 0
+        self.last_completed = 0
+
+        self.root = tk.Tk()
+        self.root.title("LTspice Library Auditor")
+        self.root.geometry("980x720")
+        self.root.minsize(820, 560)
+
+        # Variables liees aux widgets
+        self.root_var = tk.StringVar()
+        self.out_var = tk.StringVar()
+        self.ltspice_var = tk.StringVar()
+        self.ext_var = tk.StringVar(value=".lib,.sub,.cir,.mod,.txt,.si")
+        self.jobs_var = tk.IntVar(value=max(1, (os.cpu_count() or 2) - 1))
+        self.timeout_var = tk.IntVar(value=15)
+        self.group_size_var = tk.IntVar(value=20)
+        self.max_files_var = tk.IntVar(value=0)
+        self.max_subckts_var = tk.IntVar(value=0)
+        self.only_suspect_var = tk.BooleanVar(value=False)
+        self.skip_broken_var = tk.BooleanVar(value=False)
+        self.no_batch_var = tk.BooleanVar(value=False)
+        self.no_cache_var = tk.BooleanVar(value=False)
+        self.keep_raw_var = tk.BooleanVar(value=False)
+        self.no_report_var = tk.BooleanVar(value=False)
+
+        self._build_ui()
+        self._load_settings()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---- UI ----
+    def _build_ui(self):
+        tk = self._tk
+        ttk = self._ttk
+
+        # En-tete
+        header = ttk.Frame(self.root, padding=(12, 10, 12, 4))
+        header.pack(fill='x')
+        ttk.Label(header, text="LTspice Library Auditor",
+                  font=('Segoe UI', 14, 'bold')).pack(anchor='w')
+        ttk.Label(header,
+                  text="Audit parallele d'une librairie LTspice tierce. Detecte les sous-circuits cassesm,"
+                       " genere des rapports CSV et un rapport HTML interactif.",
+                  foreground='#555').pack(anchor='w')
+
+        # Form (chemins)
+        paths = ttk.LabelFrame(self.root, text="Chemins", padding=10)
+        paths.pack(fill='x', padx=12, pady=(8, 4))
+        paths.columnconfigure(1, weight=1)
+
+        self._make_path_row(paths, 0, "Racine librairie:", self.root_var,
+                            self._browse_root, is_dir=True)
+        self._make_path_row(paths, 1, "Dossier sortie:", self.out_var,
+                            self._browse_out, is_dir=True)
+        self._make_path_row(paths, 2, "LTspice.exe (optionnel):", self.ltspice_var,
+                            self._browse_ltspice, is_dir=False)
+
+        ttk.Label(paths, text="Extensions scannees:").grid(row=3, column=0, sticky='w', pady=(6, 0))
+        ttk.Entry(paths, textvariable=self.ext_var).grid(row=3, column=1, sticky='ew', padx=(8, 0), pady=(6, 0))
+
+        # Options
+        opts = ttk.LabelFrame(self.root, text="Options", padding=10)
+        opts.pack(fill='x', padx=12, pady=4)
+        for c in range(6):
+            opts.columnconfigure(c, weight=1)
+
+        ttk.Checkbutton(opts, text="Mode rapide (--only-suspect)",
+                        variable=self.only_suspect_var).grid(row=0, column=0, sticky='w', padx=4)
+        ttk.Checkbutton(opts, text="Sauter BROKEN_LIKELY au batch",
+                        variable=self.skip_broken_var).grid(row=0, column=1, sticky='w', padx=4)
+        ttk.Checkbutton(opts, text="Pas de batch (decks seulement)",
+                        variable=self.no_batch_var).grid(row=0, column=2, sticky='w', padx=4)
+        ttk.Checkbutton(opts, text="Ignorer le cache",
+                        variable=self.no_cache_var).grid(row=1, column=0, sticky='w', padx=4)
+        ttk.Checkbutton(opts, text="Garder les .raw / .net",
+                        variable=self.keep_raw_var).grid(row=1, column=1, sticky='w', padx=4)
+        ttk.Checkbutton(opts, text="Pas de rapport HTML",
+                        variable=self.no_report_var).grid(row=1, column=2, sticky='w', padx=4)
+
+        # Numeriques
+        nums = ttk.LabelFrame(self.root, text="Reglages", padding=10)
+        nums.pack(fill='x', padx=12, pady=4)
+        ttk.Label(nums, text="Workers (-j):").grid(row=0, column=0, sticky='w')
+        ttk.Spinbox(nums, from_=1, to=64, textvariable=self.jobs_var, width=6).grid(row=0, column=1, padx=(4, 16))
+        ttk.Label(nums, text="Timeout (s):").grid(row=0, column=2, sticky='w')
+        ttk.Spinbox(nums, from_=1, to=600, textvariable=self.timeout_var, width=6).grid(row=0, column=3, padx=(4, 16))
+        ttk.Label(nums, text="Group size:").grid(row=0, column=4, sticky='w')
+        ttk.Spinbox(nums, from_=1, to=200, textvariable=self.group_size_var, width=6).grid(row=0, column=5, padx=(4, 16))
+        ttk.Label(nums, text="Max files:").grid(row=0, column=6, sticky='w')
+        ttk.Spinbox(nums, from_=0, to=999999, textvariable=self.max_files_var, width=8).grid(row=0, column=7, padx=(4, 16))
+        ttk.Label(nums, text="Max subckts:").grid(row=0, column=8, sticky='w')
+        ttk.Spinbox(nums, from_=0, to=999999, textvariable=self.max_subckts_var, width=8).grid(row=0, column=9, padx=(4, 0))
+
+        # Boutons d'action
+        actions = ttk.Frame(self.root, padding=(12, 8, 12, 4))
+        actions.pack(fill='x')
+        self.start_btn = ttk.Button(actions, text="Demarrer l'audit", command=self._on_start)
+        self.start_btn.pack(side='left')
+        self.stop_btn = ttk.Button(actions, text="Arreter (sauve cache)", command=self._on_stop, state='disabled')
+        self.stop_btn.pack(side='left', padx=6)
+        ttk.Button(actions, text="Regenerer rapport HTML", command=self._on_report_only).pack(side='left', padx=6)
+        ttk.Button(actions, text="Ouvrir rapport", command=self._open_report).pack(side='left', padx=6)
+        ttk.Button(actions, text="Ouvrir dossier sortie", command=self._open_outdir).pack(side='left', padx=6)
+
+        # Progression
+        prog = ttk.Frame(self.root, padding=(12, 4))
+        prog.pack(fill='x')
+        prog.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(prog, length=600, mode='determinate', maximum=100)
+        self.progress.grid(row=0, column=0, sticky='ew')
+        self.status_label = ttk.Label(prog, text="Pret", foreground='#1a3a5e')
+        self.status_label.grid(row=0, column=1, sticky='w', padx=(12, 0))
+
+        # Log
+        logf = ttk.LabelFrame(self.root, text="Logs", padding=8)
+        logf.pack(fill='both', expand=True, padx=12, pady=(4, 12))
+        self.log_text = tk.Text(logf, height=18, wrap='word', font=('Consolas', 9),
+                                background='#1e1e1e', foreground='#d4d4d4',
+                                insertbackground='#fff')
+        log_scroll = ttk.Scrollbar(logf, command=self.log_text.yview)
+        self.log_text.config(yscrollcommand=log_scroll.set)
+        self.log_text.pack(side='left', fill='both', expand=True)
+        log_scroll.pack(side='right', fill='y')
+        # Couleurs
+        self.log_text.tag_configure('info', foreground='#9cdcfe')
+        self.log_text.tag_configure('warn', foreground='#dcdcaa')
+        self.log_text.tag_configure('err', foreground='#f48771')
+        self.log_text.tag_configure('ok', foreground='#b5cea8')
+
+    def _make_path_row(self, parent, row, label, var, command, is_dir=True):
+        ttk = self._ttk
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky='w', pady=2)
+        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky='ew', padx=(8, 4), pady=2)
+        ttk.Button(parent, text="Parcourir...", command=command).grid(row=row, column=2, pady=2)
+
+    # ---- Helpers UI ----
+    def _browse_root(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Choisir la racine de la librairie",
+                                     initialdir=self.root_var.get() or str(Path.home()))
+        if d:
+            self.root_var.set(d)
+
+    def _browse_out(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Choisir le dossier de sortie",
+                                     initialdir=self.out_var.get() or str(Path.home()))
+        if d:
+            self.out_var.set(d)
+
+    def _browse_ltspice(self):
+        from tkinter import filedialog
+        f = filedialog.askopenfilename(title="Localiser LTspice.exe",
+                                        filetypes=[("Executables", "*.exe"), ("Tous", "*.*")],
+                                        initialdir=self.ltspice_var.get() or r"C:\Program Files")
+        if f:
+            self.ltspice_var.set(f)
+
+    def _append_log(self, line: str):
+        tag = 'info'
+        if '[ERREUR]' in line or 'EXEC_ERROR' in line or 'Traceback' in line:
+            tag = 'err'
+        elif '[WARN]' in line or 'TIMEOUT' in line or 'FAIL_' in line:
+            tag = 'warn'
+        elif '[OK]' in line or 'OK ' in line[:6]:
+            tag = 'ok'
+        self.log_text.insert('end', line + '\n', tag)
+        self.log_text.see('end')
+
+    def _process_line(self, line: str):
+        self._append_log(line)
+        m = PROGRESS_RE.search(line)
+        if m:
+            completed = int(m.group(1))
+            total = int(m.group(2))
+            self.last_completed = completed
+            self.last_total = total
+            elapsed = (time.time() - self.start_time) if self.start_time else 0
+            rate = completed / elapsed if elapsed > 0 else 0
+            eta = (total - completed) / rate if rate > 0 else 0
+            pct = (100 * completed / total) if total else 0
+            self.progress['value'] = pct
+            self.status_label['text'] = (f'{completed}/{total} ({pct:.1f}%) '
+                                         f'- {rate*60:.0f}/min - ETA {fmt_eta(eta)}')
+
+    # ---- Build CLI args from form ----
+    def _build_cli_args(self) -> Optional[List[str]]:
+        from tkinter import messagebox
+        if not self.no_batch_var.get() and not self.root_var.get().strip():
+            messagebox.showerror("Erreur", "Le champ 'Racine librairie' est requis.")
+            return None
+        if not self.out_var.get().strip():
+            messagebox.showerror("Erreur", "Le champ 'Dossier sortie' est requis.")
+            return None
+
+        a: List[str] = []
+        if self.root_var.get().strip():
+            a += ["--root", self.root_var.get().strip()]
+        a += ["--out", self.out_var.get().strip()]
+        if self.ltspice_var.get().strip():
+            a += ["--ltspice", self.ltspice_var.get().strip()]
+        if self.ext_var.get().strip():
+            a += ["--extensions", self.ext_var.get().strip()]
+        a += ["-j", str(int(self.jobs_var.get() or 0))]
+        a += ["--timeout", str(int(self.timeout_var.get() or 15))]
+        a += ["--group-size", str(int(self.group_size_var.get() or 1))]
+        if int(self.max_files_var.get() or 0) > 0:
+            a += ["--max-files", str(int(self.max_files_var.get()))]
+        if int(self.max_subckts_var.get() or 0) > 0:
+            a += ["--max-subckts", str(int(self.max_subckts_var.get()))]
+        if self.only_suspect_var.get():
+            a.append("--only-suspect")
+        if self.skip_broken_var.get():
+            a.append("--skip-broken-batch")
+        if self.no_batch_var.get():
+            a.append("--no-batch")
+        if self.no_cache_var.get():
+            a.append("--no-cache")
+        if self.keep_raw_var.get():
+            a.append("--keep-raw")
+        if self.no_report_var.get():
+            a.append("--no-report")
+        return a
+
+    # ---- Sous-processus ----
+    def _on_start(self):
+        import threading
+        from tkinter import messagebox
+
+        if self.process is not None and self.process.poll() is None:
+            messagebox.showwarning("En cours", "Un audit tourne deja.")
+            return
+
+        cli_args = self._build_cli_args()
+        if cli_args is None:
+            return
+
+        self._save_settings()
+        self.log_text.delete('1.0', 'end')
+        self.progress['value'] = 0
+        self.status_label['text'] = "Demarrage..."
+        self.start_time = time.time()
+        self.last_total = 0
+        self.last_completed = 0
+
+        # Resoudre python.exe (eviter pythonw.exe sans stdout)
+        py_exe = sys.executable
+        if py_exe.lower().endswith('pythonw.exe'):
+            cand = Path(py_exe).with_name('python.exe')
+            if cand.exists():
+                py_exe = str(cand)
+
+        script = str(Path(__file__).resolve())
+        cmd = [py_exe, "-u", script, *cli_args]
+        self._append_log("$ " + " ".join(f'"{c}"' if ' ' in c else c for c in cmd))
+
+        env = dict(os.environ)
+        env['PYTHONUNBUFFERED'] = '1'
+        env['PYTHONIOENCODING'] = 'utf-8'
+
+        flags = 0
+        if sys.platform == 'win32':
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+                creationflags=flags,
+                env=env,
+            )
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Impossible de lancer le sous-processus:\n{exc}")
+            self.process = None
+            return
+
+        self.start_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')
+
+        self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reader_thread.start()
+        self.root.after(80, self._poll_queue)
+
+    def _reader_loop(self):
+        try:
+            assert self.process is not None and self.process.stdout is not None
+            for line in iter(self.process.stdout.readline, ''):
+                self._q.put(line.rstrip('\r\n'))
+        except Exception as exc:
+            self._q.put(f"[ERREUR] Lecture stdout: {exc}")
+        finally:
+            self._q.put(None)
+
+    def _poll_queue(self):
+        import queue as _queue
+        if self.process is None:
+            return
+        drained = 0
+        try:
+            while drained < 100:
+                line = self._q.get_nowait()
+                drained += 1
+                if line is None:
+                    self._on_finished()
+                    return
+                self._process_line(line)
+        except _queue.Empty:
+            pass
+        if self.process is not None:
+            self.root.after(80, self._poll_queue)
+
+    def _on_finished(self):
+        rc = self.process.poll() if self.process else None
+        self.process = None
+        self.start_btn.config(state='normal')
+        self.stop_btn.config(state='disabled')
+        if rc == 0:
+            self.status_label['text'] = "Termine"
+            self._append_log(f"[GUI] Audit termine (exit {rc}).")
+        else:
+            self.status_label['text'] = f"Termine (exit {rc})"
+            self._append_log(f"[GUI] Audit termine avec code {rc}.")
+
+    def _on_stop(self):
+        import signal as _signal
+        from tkinter import messagebox
+        if not self.process or self.process.poll() is not None:
+            return
+        try:
+            if sys.platform == 'win32':
+                self.process.send_signal(_signal.CTRL_BREAK_EVENT)
+            else:
+                self.process.send_signal(_signal.SIGINT)
+            self.status_label['text'] = "Arret en cours (sauvegarde du cache)..."
+            self._append_log("[GUI] Signal d'arret envoye, attente sauvegarde du cache.")
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Impossible d'envoyer le signal: {exc}")
+
+    def _on_report_only(self):
+        import threading
+        from tkinter import messagebox
+        out = self.out_var.get().strip()
+        if not out or not (Path(out) / "reports").exists():
+            messagebox.showerror("Erreur", "Pas de CSV trouves dans ce dossier de sortie.")
+            return
+        py_exe = sys.executable
+        if py_exe.lower().endswith('pythonw.exe'):
+            cand = Path(py_exe).with_name('python.exe')
+            if cand.exists():
+                py_exe = str(cand)
+        script = str(Path(__file__).resolve())
+        cmd = [py_exe, "-u", script, "--out", out, "--report-only"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                                 encoding='utf-8', errors='replace')
+            self._append_log(res.stdout or "")
+            if res.stderr:
+                self._append_log(res.stderr)
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"{exc}")
+
+    def _open_report(self):
+        import webbrowser
+        from tkinter import messagebox
+        out = self.out_var.get().strip()
+        if not out:
+            messagebox.showerror("Erreur", "Renseigne d'abord le dossier de sortie.")
+            return
+        p = Path(out) / REPORT_FILENAME
+        if not p.exists():
+            messagebox.showerror("Erreur", f"Aucun rapport trouve : {p}")
+            return
+        webbrowser.open(p.as_uri())
+
+    def _open_outdir(self):
+        from tkinter import messagebox
+        out = self.out_var.get().strip()
+        if not out:
+            messagebox.showerror("Erreur", "Renseigne d'abord le dossier de sortie.")
+            return
+        p = Path(out)
+        if not p.exists():
+            messagebox.showerror("Erreur", f"Dossier inexistant : {p}")
+            return
+        try:
+            if sys.platform == 'win32':
+                os.startfile(str(p))  # type: ignore[attr-defined]
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', str(p)])
+            else:
+                subprocess.Popen(['xdg-open', str(p)])
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"{exc}")
+
+    # ---- Persistance des reglages ----
+    def _save_settings(self):
+        data = {
+            'root': self.root_var.get(),
+            'out': self.out_var.get(),
+            'ltspice': self.ltspice_var.get(),
+            'extensions': self.ext_var.get(),
+            'jobs': int(self.jobs_var.get() or 0),
+            'timeout': int(self.timeout_var.get() or 15),
+            'group_size': int(self.group_size_var.get() or 20),
+            'max_files': int(self.max_files_var.get() or 0),
+            'max_subckts': int(self.max_subckts_var.get() or 0),
+            'only_suspect': bool(self.only_suspect_var.get()),
+            'skip_broken_batch': bool(self.skip_broken_var.get()),
+            'no_batch': bool(self.no_batch_var.get()),
+            'no_cache': bool(self.no_cache_var.get()),
+            'keep_raw': bool(self.keep_raw_var.get()),
+            'no_report': bool(self.no_report_var.get()),
+        }
+        try:
+            GUI_SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+    def _load_settings(self):
+        if not GUI_SETTINGS_PATH.exists():
+            return
+        try:
+            data = json.loads(GUI_SETTINGS_PATH.read_text(encoding='utf-8'))
+        except Exception:
+            return
+        self.root_var.set(data.get('root', ''))
+        self.out_var.set(data.get('out', ''))
+        self.ltspice_var.set(data.get('ltspice', ''))
+        self.ext_var.set(data.get('extensions', self.ext_var.get()))
+        self.jobs_var.set(int(data.get('jobs', self.jobs_var.get())))
+        self.timeout_var.set(int(data.get('timeout', 15)))
+        self.group_size_var.set(int(data.get('group_size', 20)))
+        self.max_files_var.set(int(data.get('max_files', 0)))
+        self.max_subckts_var.set(int(data.get('max_subckts', 0)))
+        self.only_suspect_var.set(bool(data.get('only_suspect', False)))
+        self.skip_broken_var.set(bool(data.get('skip_broken_batch', False)))
+        self.no_batch_var.set(bool(data.get('no_batch', False)))
+        self.no_cache_var.set(bool(data.get('no_cache', False)))
+        self.keep_raw_var.set(bool(data.get('keep_raw', False)))
+        self.no_report_var.set(bool(data.get('no_report', False)))
+
+    def _on_close(self):
+        self._save_settings()
+        if self.process and self.process.poll() is None:
+            from tkinter import messagebox
+            if messagebox.askyesno("Audit en cours",
+                                    "Un audit tourne. Le cache sera sauve avant arret. Quitter ?"):
+                try:
+                    if sys.platform == 'win32':
+                        import signal as _signal
+                        self.process.send_signal(_signal.CTRL_BREAK_EVENT)
+                    else:
+                        self.process.terminate()
+                except Exception:
+                    pass
+            else:
+                return
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1141,8 +1660,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Audit automatise de librairies LTspice third-party (parallele + cache)"
     )
-    parser.add_argument("--root", default="", help="Dossier racine de la librairie a auditer (requis sauf --report-only)")
-    parser.add_argument("--out", required=True, help="Dossier de sortie pour rapports et decks")
+    parser.add_argument("--root", default="", help="Dossier racine de la librairie a auditer (requis sauf --gui / --report-only)")
+    parser.add_argument("--out", default="", help="Dossier de sortie pour rapports et decks (requis sauf --gui)")
     parser.add_argument("--ltspice", default="", help="Chemin vers LTspice.exe / XVIIx64.exe")
     parser.add_argument("--extensions", default=".lib,.sub,.cir,.mod,.txt,.si",
                         help="Extensions a scanner, separees par des virgules")
@@ -1168,7 +1687,19 @@ def main() -> int:
                         help="Ne genere pas le rapport HTML en fin d'audit")
     parser.add_argument("--report-only", action="store_true",
                         help="Regenere uniquement le rapport HTML depuis les CSV existants (pas d'audit)")
+    parser.add_argument("--group-size", type=int, default=20,
+                        help="Sous-circuits regroupes par deck pour amortir le startup LTspice "
+                             "(defaut 20 ; 1 = desactive). Les groupes qui echouent sont retestes individuellement.")
+    parser.add_argument("--gui", action="store_true",
+                        help="Lance l'interface graphique au lieu du mode CLI")
     args = parser.parse_args()
+
+    if args.gui:
+        return launch_gui()
+
+    if not args.out:
+        print("[ERREUR] --out est requis (sauf en mode --gui).")
+        return 2
 
     out = Path(args.out).expanduser().resolve()
 
@@ -1329,11 +1860,10 @@ def main() -> int:
     )
 
     # ============================================================
-    # PREPARATION BATCH
+    # PREPARATION BATCH (avec groupement de subckts si --group-size > 1)
     # ============================================================
     summary_map: Dict[str, FileSummary] = {x.file_path: x for x in summaries}
     command_rows: List[dict] = []
-    tasks: List[dict] = []
     batch_results: List[BatchResult] = []
 
     ltspice_exe = find_ltspice_exe(args.ltspice.strip() or None)
@@ -1349,6 +1879,11 @@ def main() -> int:
         cmd_prefix = detect_ltspice_cmd_form(ltspice_exe, decks_dir)
         print(f"[INFO] Forme de cmd    : {' '.join(cmd_prefix)}")
 
+    group_size = max(1, args.group_size)
+    if not args.no_batch and ltspice_exe is not None and group_size > 1:
+        print(f"[INFO] Groupement      : {group_size} subckts par deck "
+              f"(fallback individuel si echec)")
+
     def file_skip_for_batch(fs: FileSummary) -> bool:
         if args.only_suspect and fs.status not in {"SUSPECT", "BROKEN_LIKELY", "READ_ERROR"}:
             return True
@@ -1361,11 +1896,46 @@ def main() -> int:
             return f'"{ltspice_exe}" ' + " ".join(cmd_prefix) + f' "{cir_path}"'
         return f'LTspice.exe -b "{cir_path}"'
 
-    # Test 1 : parsing par fichier
+    def restore_cached_to_results(cached: dict) -> bool:
+        try:
+            batch_results.append(BatchResult(
+                target_kind=cached["target_kind"],
+                file_path=cached["file_path"],
+                rel_path=cached["rel_path"],
+                target_name=cached["target_name"],
+                test_cir=cached["test_cir"],
+                status=cached["status"],
+                exit_code=cached["exit_code"],
+                error_summary=cached["error_summary"],
+                raw_log_path=cached["raw_log_path"],
+            ))
+            return True
+        except Exception:
+            return False
+
+    def append_result_from_dict(res: dict) -> None:
+        batch_results.append(BatchResult(
+            target_kind=res["target_kind"],
+            file_path=res["file_path"],
+            rel_path=res["rel_path"],
+            target_name=res["target_name"],
+            test_cir=res["test_cir"],
+            status=res["status"],
+            exit_code=res["exit_code"],
+            error_summary=res["error_summary"],
+            raw_log_path=res["raw_log_path"],
+        ))
+
+    # ---- A. FILE_PARSE par fichier ----
+    file_parse_tasks: List[dict] = []
+    file_parse_cache_hits = 0
     for fs in summaries:
         if file_skip_for_batch(fs):
             continue
         file_path = Path(fs.file_path)
+        file_h = file_hashes.get(fs.file_path, "no_hash")
+        task_id = f"{file_h}|FILE_PARSE|(file)"
+
         deck_name = safe_name(fs.rel_path) + "__file_parse_test.cir"
         cir_path = decks_dir / deck_name
         cir_path.write_text(build_file_parse_test_deck(file_path), encoding="utf-8")
@@ -1377,10 +1947,12 @@ def main() -> int:
             "cir_path": str(cir_path),
             "suggested_command": make_cmd_str(cir_path),
         })
-        if not args.no_batch and ltspice_exe is not None:
-            file_h = file_hashes.get(fs.file_path, "no_hash")
-            task_id = f"{file_h}|FILE_PARSE|(file)"
-            tasks.append({
+
+        cached = cache["batch"].get(task_id) if not args.no_cache else None
+        if cached and restore_cached_to_results(cached):
+            file_parse_cache_hits += 1
+        elif not args.no_batch and ltspice_exe is not None:
+            file_parse_tasks.append({
                 "task_id": task_id,
                 "target_kind": "FILE_PARSE",
                 "file_path": fs.file_path,
@@ -1393,42 +1965,107 @@ def main() -> int:
                 "keep_raw": args.keep_raw,
             })
 
-    # Test 2 : sous-circuits
-    subckt_iter = subckts
+    # ---- B. SUBCKTS : cache check + groupement par fichier ----
+    subs_iter = subckts
     if args.max_subckts and args.max_subckts > 0:
-        subckt_iter = subckt_iter[:args.max_subckts]
+        subs_iter = subs_iter[:args.max_subckts]
 
-    for sub in subckt_iter:
+    non_cached_subs_per_file: Dict[str, List[SubcktInfo]] = {}
+    sub_cache_hits = 0
+    for sub in subs_iter:
         fs = summary_map.get(sub.file_path)
         if fs and file_skip_for_batch(fs):
             continue
-        file_path = Path(sub.file_path)
-        deck_name = safe_name(sub.rel_path + "__" + sub.name) + "__subckt_test.cir"
-        cir_path = decks_dir / deck_name
-        cir_path.write_text(build_subckt_test_deck(file_path, sub.name, sub.pin_count), encoding="utf-8")
-        command_rows.append({
-            "kind": "SUBCKT_INSTANTIATION",
-            "file_path": sub.file_path,
-            "rel_path": sub.rel_path,
-            "target_name": sub.name,
-            "cir_path": str(cir_path),
-            "suggested_command": make_cmd_str(cir_path),
-        })
-        if not args.no_batch and ltspice_exe is not None:
-            file_h = file_hashes.get(sub.file_path, "no_hash")
-            task_id = f"{file_h}|SUBCKT_INSTANTIATION|{sub.name}"
-            tasks.append({
-                "task_id": task_id,
-                "target_kind": "SUBCKT_INSTANTIATION",
-                "file_path": sub.file_path,
-                "rel_path": sub.rel_path,
-                "target_name": sub.name,
-                "cir_path": str(cir_path),
-                "ltspice_exe": str(ltspice_exe),
-                "cmd_prefix": cmd_prefix,
-                "timeout": args.timeout,
-                "keep_raw": args.keep_raw,
-            })
+        file_h = file_hashes.get(sub.file_path, "no_hash")
+        indiv_id = f"{file_h}|SUBCKT_INSTANTIATION|{sub.name}"
+        cached = cache["batch"].get(indiv_id) if not args.no_cache else None
+        if cached and restore_cached_to_results(cached):
+            sub_cache_hits += 1
+        else:
+            non_cached_subs_per_file.setdefault(sub.file_path, []).append(sub)
+
+    pass1_subckt_tasks: List[dict] = []
+    for file_path_str, members in non_cached_subs_per_file.items():
+        fs = summary_map.get(file_path_str)
+        if fs is None:
+            continue
+        file_h = file_hashes.get(file_path_str, "no_hash")
+        abs_file_path = Path(file_path_str)
+
+        # Decoupage en lots de group_size
+        chunks_iter = [members[i:i + group_size]
+                       for i in range(0, len(members), group_size)]
+
+        for chunk_idx, chunk in enumerate(chunks_iter):
+            if len(chunk) == 1 or group_size <= 1:
+                sub = chunk[0]
+                deck_name = safe_name(sub.rel_path + "__" + sub.name) + "__subckt_test.cir"
+                cir_path = decks_dir / deck_name
+                cir_path.write_text(
+                    build_subckt_test_deck(abs_file_path, sub.name, sub.pin_count),
+                    encoding="utf-8"
+                )
+                command_rows.append({
+                    "kind": "SUBCKT_INSTANTIATION",
+                    "file_path": sub.file_path,
+                    "rel_path": sub.rel_path,
+                    "target_name": sub.name,
+                    "cir_path": str(cir_path),
+                    "suggested_command": make_cmd_str(cir_path),
+                })
+                if not args.no_batch and ltspice_exe is not None:
+                    pass1_subckt_tasks.append({
+                        "task_id": f"{file_h}|SUBCKT_INSTANTIATION|{sub.name}",
+                        "target_kind": "SUBCKT_INSTANTIATION",
+                        "file_path": sub.file_path,
+                        "rel_path": sub.rel_path,
+                        "target_name": sub.name,
+                        "cir_path": str(cir_path),
+                        "ltspice_exe": str(ltspice_exe),
+                        "cmd_prefix": cmd_prefix,
+                        "timeout": args.timeout,
+                        "keep_raw": args.keep_raw,
+                    })
+            else:
+                names = [s.name for s in chunk]
+                preview = ",".join(names[:3]) + ("..." if len(names) > 3 else "")
+                target_name = f"GROUP[{preview}]({len(names)})"
+                deck_name = safe_name(fs.rel_path + f"__group{chunk_idx:04d}") + "__subckt_group_test.cir"
+                cir_path = decks_dir / deck_name
+                cir_path.write_text(
+                    build_subckt_group_test_deck(
+                        abs_file_path, [(s.name, s.pin_count) for s in chunk]
+                    ),
+                    encoding="utf-8"
+                )
+                command_rows.append({
+                    "kind": "SUBCKT_GROUP",
+                    "file_path": fs.file_path,
+                    "rel_path": fs.rel_path,
+                    "target_name": target_name,
+                    "cir_path": str(cir_path),
+                    "suggested_command": make_cmd_str(cir_path),
+                })
+                if not args.no_batch and ltspice_exe is not None:
+                    pass1_subckt_tasks.append({
+                        "task_id": f"{file_h}|SUBCKT_GROUP|{chunk_idx:04d}|{names[0]}",
+                        "target_kind": "SUBCKT_GROUP",
+                        "file_path": fs.file_path,
+                        "rel_path": fs.rel_path,
+                        "target_name": target_name,
+                        "cir_path": str(cir_path),
+                        "ltspice_exe": str(ltspice_exe),
+                        "cmd_prefix": cmd_prefix,
+                        "timeout": args.timeout,
+                        "keep_raw": args.keep_raw,
+                        "members": [
+                            {"name": s.name, "rel_path": s.rel_path, "pin_count": s.pin_count}
+                            for s in chunk
+                        ],
+                        "file_h": file_h,
+                    })
+
+    pass1_tasks = file_parse_tasks + pass1_subckt_tasks
 
     write_csv(
         reports_dir / "batch_commands.csv",
@@ -1436,52 +2073,28 @@ def main() -> int:
         fieldnames=["kind", "file_path", "rel_path", "target_name", "cir_path", "suggested_command"],
     )
 
-    # ============================================================
-    # CACHE BATCH : recupere ce qui a deja ete teste
-    # ============================================================
-    if tasks and not args.no_cache:
-        kept_tasks: List[dict] = []
-        cache_hits = 0
-        for t in tasks:
-            cached = cache["batch"].get(t["task_id"])
-            if cached:
-                try:
-                    batch_results.append(BatchResult(
-                        target_kind=cached["target_kind"],
-                        file_path=cached["file_path"],
-                        rel_path=cached["rel_path"],
-                        target_name=cached["target_name"],
-                        test_cir=cached["test_cir"],
-                        status=cached["status"],
-                        exit_code=cached["exit_code"],
-                        error_summary=cached["error_summary"],
-                        raw_log_path=cached["raw_log_path"],
-                    ))
-                    cache_hits += 1
-                except Exception:
-                    kept_tasks.append(t)
-            else:
-                kept_tasks.append(t)
-        print(f"[INFO] Cache batch     : {cache_hits} hit / {len(kept_tasks)} a executer.")
-        tasks = kept_tasks
+    total_cache_hits = file_parse_cache_hits + sub_cache_hits
+    if not args.no_cache and total_cache_hits:
+        print(f"[INFO] Cache batch     : {total_cache_hits} hit "
+              f"({file_parse_cache_hits} fichier, {sub_cache_hits} subckt).")
 
-    # ============================================================
-    # EXECUTION BATCH PARALLELE
-    # ============================================================
-    if tasks:
-        print(f"[INFO] Lancement batch : {len(tasks)} tests, {jobs} workers, timeout={args.timeout}s")
+    # ---- C. Helper pour executer une passe en parallele ----
+    def _run_pass(tasks_list: List[dict], label: str) -> List[dict]:
+        if not tasks_list:
+            return []
+        print(f"[INFO] {label} : {len(tasks_list)} tests, {jobs} workers, timeout={args.timeout}s")
         t0 = time.time()
-        completed = 0
-        last_save = 0
-
+        out_results: List[dict] = []
+        completed_local = 0
+        last_save_local = 0
         try:
             with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as exe:
-                futures = {exe.submit(_batch_worker, t): t for t in tasks}
+                futures = {exe.submit(_batch_worker, t): t for t in tasks_list}
                 for fut in concurrent.futures.as_completed(futures):
+                    t = futures[fut]
                     try:
                         res = fut.result()
                     except Exception as exc:
-                        t = futures[fut]
                         res = {
                             "task_id": t["task_id"],
                             "target_kind": t["target_kind"],
@@ -1494,32 +2107,23 @@ def main() -> int:
                             "error_summary": f"{type(exc).__name__}: {exc}",
                             "raw_log_path": "",
                         }
+                    # Propage les infos hors-worker (utile pour SUBCKT_GROUP)
+                    if t.get("target_kind") == "SUBCKT_GROUP":
+                        res["members"] = t.get("members", [])
+                        res["file_h"] = t.get("file_h", "no_hash")
+                    out_results.append(res)
+                    completed_local += 1
 
-                    batch_results.append(BatchResult(
-                        target_kind=res["target_kind"],
-                        file_path=res["file_path"],
-                        rel_path=res["rel_path"],
-                        target_name=res["target_name"],
-                        test_cir=res["test_cir"],
-                        status=res["status"],
-                        exit_code=res["exit_code"],
-                        error_summary=res["error_summary"],
-                        raw_log_path=res["raw_log_path"],
-                    ))
-                    if not args.no_cache:
-                        cache["batch"][res["task_id"]] = res
-                    completed += 1
-
-                    if not args.no_cache and (completed - last_save >= CACHE_SAVE_EVERY):
+                    if not args.no_cache and (completed_local - last_save_local >= CACHE_SAVE_EVERY):
                         save_cache(cache_path, cache)
-                        last_save = completed
+                        last_save_local = completed_local
 
-                    if completed % 50 == 0 or completed == len(tasks):
+                    if completed_local % 50 == 0 or completed_local == len(tasks_list):
                         elapsed = time.time() - t0
-                        rate = completed / elapsed if elapsed > 0 else 0
-                        eta_s = (len(tasks) - completed) / rate if rate > 0 else 0
-                        pct = 100 * completed / len(tasks)
-                        print(f"[INFO] Batch: {completed}/{len(tasks)} ({pct:.1f}%) "
+                        rate = completed_local / elapsed if elapsed > 0 else 0
+                        eta_s = (len(tasks_list) - completed_local) / rate if rate > 0 else 0
+                        pct = 100 * completed_local / len(tasks_list)
+                        print(f"[INFO] {label}: {completed_local}/{len(tasks_list)} ({pct:.1f}%) "
                               f"- {rate*60:.0f} tests/min - ETA {fmt_eta(eta_s)}")
         except KeyboardInterrupt:
             print("[WARN] Interruption clavier. Sauvegarde du cache avant sortie...")
@@ -1529,8 +2133,79 @@ def main() -> int:
 
         if not args.no_cache:
             save_cache(cache_path, cache)
-        print(f"[INFO] Batch termine en {fmt_eta(time.time() - t0)}.")
-    elif not args.no_batch and ltspice_exe is not None:
+        print(f"[INFO] {label} termine en {fmt_eta(time.time() - t0)}.")
+        return out_results
+
+    # ---- D. Passe 1 : FILE_PARSE + SUBCKT_GROUP / individus ----
+    pass2_tasks: List[dict] = []
+    if pass1_tasks:
+        pass1_results = _run_pass(pass1_tasks, "Batch passe 1")
+        for res in pass1_results:
+            kind = res.get("target_kind", "")
+            if kind == "SUBCKT_GROUP":
+                members = res.get("members", [])
+                file_h = res.get("file_h", "no_hash")
+                file_path_s = res["file_path"]
+                rel_path_s = res["rel_path"]
+                if res["status"] == "OK":
+                    # Synthese : chaque membre est marque OK individuellement
+                    for m in members:
+                        synth = {
+                            "task_id": f"{file_h}|SUBCKT_INSTANTIATION|{m['name']}",
+                            "target_kind": "SUBCKT_INSTANTIATION",
+                            "file_path": file_path_s,
+                            "rel_path": rel_path_s,
+                            "target_name": m["name"],
+                            "test_cir": res["test_cir"],
+                            "status": "OK",
+                            "exit_code": res["exit_code"],
+                            "error_summary": "(via group test)",
+                            "raw_log_path": res["raw_log_path"],
+                        }
+                        append_result_from_dict(synth)
+                        if not args.no_cache:
+                            cache["batch"][synth["task_id"]] = synth
+                else:
+                    # Echec: fallback individuel pour chaque membre
+                    for m in members:
+                        deck_name = safe_name(m["rel_path"] + "__" + m["name"]) + "__subckt_test.cir"
+                        cir_path = decks_dir / deck_name
+                        cir_path.write_text(
+                            build_subckt_test_deck(Path(file_path_s), m["name"], m["pin_count"]),
+                            encoding="utf-8"
+                        )
+                        pass2_tasks.append({
+                            "task_id": f"{file_h}|SUBCKT_INSTANTIATION|{m['name']}",
+                            "target_kind": "SUBCKT_INSTANTIATION",
+                            "file_path": file_path_s,
+                            "rel_path": rel_path_s,
+                            "target_name": m["name"],
+                            "cir_path": str(cir_path),
+                            "ltspice_exe": str(ltspice_exe),
+                            "cmd_prefix": cmd_prefix,
+                            "timeout": args.timeout,
+                            "keep_raw": args.keep_raw,
+                        })
+            else:
+                append_result_from_dict(res)
+                if not args.no_cache:
+                    cache["batch"][res["task_id"]] = res
+
+        if not args.no_cache:
+            save_cache(cache_path, cache)
+
+    # ---- E. Passe 2 : fallback individuel pour les groupes echoues ----
+    if pass2_tasks:
+        print(f"[INFO] Fallback        : {len(pass2_tasks)} tests individuels (groupes echoues).")
+        pass2_results = _run_pass(pass2_tasks, "Batch passe 2")
+        for res in pass2_results:
+            append_result_from_dict(res)
+            if not args.no_cache:
+                cache["batch"][res["task_id"]] = res
+        if not args.no_cache:
+            save_cache(cache_path, cache)
+
+    if not pass1_tasks and not args.no_batch and ltspice_exe is not None:
         print("[INFO] Tous les tests batch sont en cache, rien a executer.")
 
     # Tri stable
