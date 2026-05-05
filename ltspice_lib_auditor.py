@@ -798,6 +798,26 @@ tbody tr:hover td { background: #fafbfd; }
 .truncate { max-width: 600px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .excerpt { font-family: Consolas, Menlo, monospace; font-size: .8rem; color: #555; max-width: 520px; word-break: break-all; white-space: pre-wrap; }
 
+/* Detail par fichier */
+.file-card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; margin: .5rem 0; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+.file-card-header { background: #eef3f8; padding: .45rem .8rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; cursor: pointer; user-select: none; }
+.file-card-header:hover { background: #dde6f0; }
+.file-card-header::before { content: "▼"; color: var(--hdr); font-size: .7rem; transition: transform .15s; }
+.file-card.collapsed .file-card-header::before { transform: rotate(-90deg); }
+.file-card.collapsed .file-card-body { display: none; }
+.file-path { font-size: .95rem; font-weight: 600; color: var(--hdr); font-family: Consolas, Menlo, monospace; }
+.file-card-meta { color: var(--muted); font-size: .82rem; margin-left: auto; }
+.file-card-body { padding: .5rem .8rem .8rem; }
+.file-card-body h4 { margin: .6rem 0 .2rem; color: var(--hdr); font-size: .88rem; }
+.file-card-body h4:first-child { margin-top: .2rem; }
+table.detail { font-size: .83rem; box-shadow: none; margin: .2rem 0; }
+table.detail th { background: #f5f7fa; cursor: default; position: static; }
+table.detail th:hover { background: #f5f7fa; }
+table.detail td { padding: .3rem .5rem; }
+.detail-actions { display: flex; gap: .5rem; align-items: center; margin-bottom: .5rem; flex-wrap: wrap; }
+.detail-actions button { padding: .25rem .6rem; border: 1px solid var(--border); background: #fff; cursor: pointer; border-radius: 4px; font-size: .82rem; }
+.detail-actions button:hover { background: #eef3f8; }
+
 footer { margin-top: 2.5rem; color: var(--muted); font-size: .82rem; text-align: center; }
 """
 
@@ -846,6 +866,41 @@ document.querySelectorAll('input[type=search][data-target]').forEach(inp => {
   inp.addEventListener('input', () => applyFilter(inp));
   applyFilter(inp);
 });
+
+// Toggle expansion d'une carte fichier
+document.querySelectorAll('.file-card-header').forEach(hdr => {
+  hdr.addEventListener('click', () => {
+    hdr.parentElement.classList.toggle('collapsed');
+  });
+});
+
+// Filtre des cartes (par chemin de fichier)
+const detailFilter = document.getElementById('filter-detail');
+if (detailFilter) {
+  const updateDetail = () => {
+    const q = detailFilter.value.toLowerCase().trim();
+    let visible = 0;
+    document.querySelectorAll('.file-card').forEach(card => {
+      const path = (card.dataset.path || '').toLowerCase();
+      const cats = (card.dataset.cats || '').toLowerCase();
+      const show = !q || path.includes(q) || cats.includes(q);
+      card.style.display = show ? '' : 'none';
+      if (show) visible++;
+    });
+    const cnt = document.getElementById('filter-detail-count');
+    if (cnt) cnt.textContent = visible + ' visible(s)';
+  };
+  detailFilter.addEventListener('input', updateDetail);
+  updateDetail();
+}
+
+// Boutons "tout ouvrir / tout fermer"
+const btnExpandAll = document.getElementById('btn-expand-all');
+const btnCollapseAll = document.getElementById('btn-collapse-all');
+if (btnExpandAll) btnExpandAll.addEventListener('click', () =>
+  document.querySelectorAll('.file-card').forEach(c => c.classList.remove('collapsed')));
+if (btnCollapseAll) btnCollapseAll.addEventListener('click', () =>
+  document.querySelectorAll('.file-card').forEach(c => c.classList.add('collapsed')));
 """
 
 
@@ -942,6 +997,125 @@ def _render_errored_files_table(err_rows: List[dict]) -> str:
         '<th>Fichier</th><th>Ext.</th><th>Statut</th>'
         '<th>Issues stat.</th><th>Échecs LTspice</th><th>Catégories</th>'
         '</tr></thead><tbody>' + "".join(body) + '</tbody></table></section>'
+    )
+
+
+def _render_per_file_detail(err_rows: List[dict],
+                            issues_by_path: Dict[str, List[dict]],
+                            batch_by_path: Dict[str, List[dict]],
+                            max_cards: int = 2000) -> str:
+    """
+    Une carte HTML par fichier en erreur, listant ses issues statiques (avec
+    numero de ligne + extrait du code) et ses echecs LTspice (avec message
+    exact). But : permettre la correction directe sans cross-reference.
+    """
+    if not err_rows:
+        return ""
+    truncated = len(err_rows) > max_cards
+    rows = err_rows[:max_cards]
+
+    cards: List[str] = []
+    for r in rows:
+        fp = r["file_path"]
+        rel = r["rel_path"]
+        status = r["status"]
+        ext = r["extension"]
+        cats = r.get("categories", "")
+        issues = issues_by_path.get(fp, [])
+        fails = [b for b in batch_by_path.get(fp, [])
+                 if b.get("status", "").startswith("FAIL")
+                 or b.get("status") in {"TIMEOUT", "EXEC_ERROR", "WARN_LOG"}]
+
+        if not issues and not fails:
+            # Fichier marque "en erreur" (statut prescan), mais aucun detail
+            # ligne par ligne (ex : status = SUSPECT a cause du score uniquement)
+            continue
+
+        # Tri des issues par numero de ligne croissant
+        def _line_key(it: dict) -> int:
+            try:
+                return int(it.get("line_no", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        issues_sorted = sorted(issues, key=_line_key)
+
+        if issues_sorted:
+            iss_body = []
+            for it in issues_sorted:
+                iss_body.append(
+                    '<tr>'
+                    f'<td>{_h(it.get("line_no",""))}</td>'
+                    f'<td><span class="status {_h(it.get("severity",""))}">{_h(it.get("severity",""))}</span></td>'
+                    f'<td><span class="status {_h(it.get("category",""))}">{_h(it.get("category",""))}</span></td>'
+                    f'<td>{_h(it.get("message",""))}</td>'
+                    f'<td class="excerpt">{_h(it.get("excerpt",""))}</td>'
+                    '</tr>'
+                )
+            iss_html = (
+                '<table class="detail"><thead><tr>'
+                '<th>Ligne</th><th>Sev.</th><th>Categorie</th><th>Message</th><th>Extrait</th>'
+                '</tr></thead><tbody>' + "".join(iss_body) + '</tbody></table>'
+            )
+        else:
+            iss_html = '<p class="no-data" style="margin:.2rem 0">Aucune issue statique sur ce fichier.</p>'
+
+        if fails:
+            fail_body = []
+            for b in fails:
+                fail_body.append(
+                    '<tr>'
+                    f'<td>{_h(b.get("target_kind",""))}</td>'
+                    f'<td><code>{_h(b.get("target_name",""))}</code></td>'
+                    f'<td><span class="status {_h(b.get("status",""))}">{_h(b.get("status",""))}</span></td>'
+                    f'<td>{_h(b.get("exit_code",""))}</td>'
+                    f'<td class="excerpt">{_h(b.get("error_summary",""))}</td>'
+                    '</tr>'
+                )
+            fail_html = (
+                '<table class="detail"><thead><tr>'
+                '<th>Type</th><th>Cible</th><th>Statut</th><th>Exit</th><th>Message LTspice</th>'
+                '</tr></thead><tbody>' + "".join(fail_body) + '</tbody></table>'
+            )
+        else:
+            fail_html = '<p class="no-data" style="margin:.2rem 0">Aucun echec LTspice (que des issues statiques).</p>'
+
+        cards.append(
+            '<div class="file-card collapsed" '
+            f'data-path="{_h(rel.lower())}" data-cats="{_h(cats.lower())}">'
+            '<div class="file-card-header">'
+            f'<span class="file-path">{_h(rel)}</span> '
+            f'<span class="status {_h(status)}">{_h(status) or "—"}</span>'
+            f'<span class="file-card-meta">{_h(ext)} · {len(issues_sorted)} issue(s) · {len(fails)} echec(s) LTspice</span>'
+            '</div>'
+            '<div class="file-card-body">'
+            '<h4>Issues statiques (parser SPICE)</h4>' + iss_html +
+            '<h4>Echecs LTspice (batch)</h4>' + fail_html +
+            '</div></div>'
+        )
+
+    if not cards:
+        return ('<section><h2>Detail par fichier</h2>'
+                '<p class="no-data">Aucun fichier ne porte de detail ligne par ligne.</p></section>')
+
+    notice = (f'<div class="notice">Cartes tronquees a {max_cards} sur {len(err_rows)} fichiers en erreur. '
+              'Les details complets restent dans les CSV.</div>') if truncated else ""
+
+    return (
+        '<section>'
+        f'<h2>Detail par fichier — a corriger ({len(cards)})</h2>'
+        '<p class="meta" style="margin-top:-.5rem">'
+        'Clique sur un en-tete pour deplier la carte. Chaque carte liste les erreurs '
+        'avec numero de ligne et extrait du code, pour correction directe.'
+        '</p>'
+        '<div class="detail-actions">'
+        '<input type="search" id="filter-detail" placeholder="filtrer par chemin ou categorie..." style="padding:.35rem .55rem;border:1px solid #dcdcdc;border-radius:4px;min-width:280px;font-size:.9rem;">'
+        '<span class="count" id="filter-detail-count" style="color:#666;font-size:.85rem"></span>'
+        '<button id="btn-expand-all" type="button">Tout ouvrir</button>'
+        '<button id="btn-collapse-all" type="button">Tout fermer</button>'
+        '</div>'
+        + notice +
+        '<div id="file-cards">' + "".join(cards) + '</div>'
+        '</section>'
     )
 
 
@@ -1141,6 +1315,7 @@ def generate_html_report(out_dir: Path) -> Optional[Path]:
     parts.append(_render_top_categories(batch_counts))
     parts.append(_render_inventory(counts_ext, counts_model_type, counts_pin_bin))
     parts.append(_render_errored_files_table(err_rows))
+    parts.append(_render_per_file_detail(err_rows, issues_by_path, batch_by_path))
     parts.append(_render_static_issues_table(static_issues))
     parts.append(_render_batch_failures_table(batch_results))
     parts.append('<footer>Rapport autonome — généré par ltspice_lib_auditor.py</footer>')
