@@ -544,6 +544,40 @@ def read_possible_log(cir_path: Path) -> Tuple[str, Optional[Path]]:
     return "", None
 
 
+LTSPICE_BANNER_RE = re.compile(r'^\s*LTspice\s+\S+\s+for\s+', re.IGNORECASE)
+
+# Patterns "innocents" : lignes qui peuvent apparaitre dans un log LTspice
+# meme en cas de succes (banniere, copyright, infos solveur, commentaires SPICE...).
+# Si le log ne contient QUE ces lignes, on considere le run OK.
+INNOCUOUS_LINE_PATTERNS = [
+    LTSPICE_BANNER_RE,
+    re.compile(r'^\s*Copyright\s*\(c\)', re.IGNORECASE),
+    re.compile(r'^\s*Direct Newton iteration', re.IGNORECASE),
+    re.compile(r'^\s*Total elapsed time', re.IGNORECASE),
+    re.compile(r'^\s*tnom\s*=', re.IGNORECASE),
+    re.compile(r'^\s*temp\s*=', re.IGNORECASE),
+    re.compile(r'^\s*method\s*=', re.IGNORECASE),
+    re.compile(r'^\s*Date:', re.IGNORECASE),
+    re.compile(r'^\s*Maximum thread count', re.IGNORECASE),
+    re.compile(r'^\s*Matrix Compiler', re.IGNORECASE),
+    re.compile(r'^\s*Solver:', re.IGNORECASE),
+    re.compile(r'^\s*BypassMode', re.IGNORECASE),
+    re.compile(r'^\s*\*'),       # commentaire SPICE
+    re.compile(r'^\s*$'),        # ligne vide
+]
+
+
+def _strip_innocuous_lines(text: str) -> str:
+    if not text:
+        return ""
+    keep = []
+    for line in text.splitlines():
+        if any(p.match(line) for p in INNOCUOUS_LINE_PATTERNS):
+            continue
+        keep.append(line)
+    return "\n".join(keep).strip()
+
+
 def classify_log(log_text: str, stderr: str, exit_code: int) -> Tuple[str, str]:
     text = "\n".join([log_text or "", stderr or ""]).strip()
 
@@ -551,6 +585,7 @@ def classify_log(log_text: str, stderr: str, exit_code: int) -> Tuple[str, str]:
         return "OK", ""
 
     lower = text.lower()
+    # Patterns d'erreur specifiques d'abord (priorite sur le strip de banniere)
     if "expected \")\"" in lower:
         return "FAIL_SYNTAX", 'Expected ")"'
     if "syntax error" in lower:
@@ -565,11 +600,39 @@ def classify_log(log_text: str, stderr: str, exit_code: int) -> Tuple[str, str]:
         return "FAIL_PINCOUNT", "Subckt pin count mismatch"
     if "fatal error" in lower:
         return "FAIL_FATAL", "Fatal error"
-    if exit_code != 0 and text:
-        return "FAIL_OTHER", text.splitlines()[:1][0][:240]
-    if exit_code == 0 and text:
-        return "WARN_LOG", text.splitlines()[:1][0][:240]
+
+    # Aucun pattern d'erreur connu. Strip des lignes innocentes (banniere,
+    # copyright, commentaires) et regarde s'il reste qqchose de non trivial.
+    text_clean = _strip_innocuous_lines(text)
+    if not text_clean:
+        return "OK", ""
+
+    if exit_code != 0:
+        return "FAIL_OTHER", text_clean.splitlines()[0][:240]
+    if exit_code == 0:
+        return "WARN_LOG", text_clean.splitlines()[0][:240]
     return "UNKNOWN", ""
+
+
+def _migrate_cache_banner_false_positives(cache: dict) -> int:
+    """
+    Requalifie les entrees deja en cache classees WARN_LOG/FAIL_OTHER alors que
+    le error_summary contient juste la banniere LTspice. Idempotent.
+    Retourne le nombre d'entrees corrigees.
+    """
+    fixed = 0
+    for entry in cache.get("batch", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status", "")
+        summary = entry.get("error_summary", "") or ""
+        if status not in {"WARN_LOG", "FAIL_OTHER"}:
+            continue
+        if LTSPICE_BANNER_RE.match(summary):
+            entry["status"] = "OK"
+            entry["error_summary"] = ""
+            fixed += 1
+    return fixed
 
 
 def _batch_worker(task: dict) -> dict:
@@ -745,8 +808,21 @@ REPORT_CSS = r"""
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--txt); background: var(--bg); padding: 1.5rem 2rem 4rem; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--txt); background: var(--bg); padding: 0 2rem 4rem; }
+section[id], div[id] { scroll-margin-top: 70px; }
 h1, h2, h3 { color: var(--hdr); }
+
+/* Barre de navigation sticky */
+nav.toc { position: sticky; top: 0; z-index: 50; background: var(--card); padding: .5rem 1rem; border-bottom: 1px solid var(--border); display: flex; gap: .35rem; flex-wrap: wrap; margin: 0 -2rem 1rem; box-shadow: 0 2px 4px rgba(0,0,0,.06); }
+nav.toc a { color: var(--hdr); text-decoration: none; font-size: .85rem; padding: .3rem .65rem; border-radius: 4px; transition: background .12s; white-space: nowrap; }
+nav.toc a:hover { background: #eef3f8; }
+nav.toc .toc-title { font-weight: 700; color: var(--hdr); margin-right: .5rem; align-self: center; font-size: .85rem; }
+
+/* Bouton flottant "haut de page" */
+.back-to-top { position: fixed; bottom: 1.5rem; right: 1.5rem; background: var(--hdr); color: #fff; border: none; border-radius: 50%; width: 44px; height: 44px; font-size: 1.4rem; font-weight: 700; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.25); display: none; z-index: 60; line-height: 1; padding: 0; }
+.back-to-top.visible { display: flex; align-items: center; justify-content: center; }
+.back-to-top:hover { background: #2a4a6e; }
+header.audit-header { padding-top: 1.5rem; }
 h1 { margin: 0 0 .25rem; font-size: 1.7rem; }
 h2 { border-bottom: 2px solid var(--hdr); padding-bottom: .3rem; margin-top: 2.2rem; font-size: 1.25rem; }
 h3 { margin: 0 0 .5rem; font-size: 1rem; }
@@ -901,6 +977,18 @@ if (btnExpandAll) btnExpandAll.addEventListener('click', () =>
   document.querySelectorAll('.file-card').forEach(c => c.classList.remove('collapsed')));
 if (btnCollapseAll) btnCollapseAll.addEventListener('click', () =>
   document.querySelectorAll('.file-card').forEach(c => c.classList.add('collapsed')));
+
+// Bouton flottant "haut de page"
+const backBtn = document.getElementById('back-to-top');
+if (backBtn) {
+  const toggleBack = () => {
+    if (window.scrollY > 400) backBtn.classList.add('visible');
+    else backBtn.classList.remove('visible');
+  };
+  window.addEventListener('scroll', toggleBack, { passive: true });
+  backBtn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+  toggleBack();
+}
 """
 
 
@@ -909,6 +997,7 @@ def _render_overview_cards(n_files: int, n_subs: int, n_models: int,
                            n_batch_ok: int, n_batch_fail: int) -> str:
     pct_ok = (100 * n_batch_ok / n_batch) if n_batch else 0
     return (
+        '<section id="overview"><h2 style="border:none;padding:0;margin:.5rem 0">Vue d\'ensemble</h2>'
         '<div class="cards">'
         f'<div class="card"><div class="num">{n_files}</div><div class="label">Fichiers scannés</div></div>'
         f'<div class="card"><div class="num">{n_subs}</div><div class="label">Sous-circuits</div></div>'
@@ -917,20 +1006,37 @@ def _render_overview_cards(n_files: int, n_subs: int, n_models: int,
         f'<div class="card"><div class="num">{n_batch}</div><div class="label">Tests LTspice</div></div>'
         f'<div class="card"><div class="num" style="color:#2e7d32">{n_batch_ok}</div><div class="label">OK ({pct_ok:.1f}%)</div></div>'
         f'<div class="card"><div class="num" style="color:#c62828">{n_batch_fail}</div><div class="label">Échecs LTspice</div></div>'
-        '</div>'
+        '</div></section>'
     )
+
+
+def _render_toc() -> str:
+    """Barre de navigation sticky en haut du rapport."""
+    items = [
+        ('overview', 'Vue d\'ensemble'),
+        ('recos', 'Recommandations'),
+        ('status', 'Statuts'),
+        ('top-cats', 'Top erreurs'),
+        ('inventory', 'Inventaire'),
+        ('errored', 'Fichiers en erreur'),
+        ('detail', 'Détail par fichier'),
+        ('static-issues', 'Issues statiques'),
+        ('batch', 'Échecs LTspice'),
+    ]
+    links = "".join(f'<a href="#{anchor}">{label}</a>' for anchor, label in items)
+    return f'<nav class="toc"><span class="toc-title">Aller à :</span>{links}</nav>'
 
 
 def _render_recommendations(recs: List[str]) -> str:
     if not recs:
         return ""
     lis = "".join(f"<li>{r}</li>" for r in recs)  # recs already pre-formatted with safe HTML <code>
-    return f'<div class="recos"><h3>Recommandations</h3><ul>{lis}</ul></div>'
+    return f'<section id="recos"><div class="recos"><h3>Recommandations</h3><ul>{lis}</ul></div></section>'
 
 
 def _render_status_section(prescan_counts: Dict[str, int], batch_counts: Dict[str, int]) -> str:
     return (
-        '<section><h2>Répartition par statut</h2><div class="cols">'
+        '<section id="status"><h2>Répartition par statut</h2><div class="cols">'
         '<div class="col-card"><h3>Statuts prescan</h3>'
         + _bar_block(prescan_counts) +
         '</div><div class="col-card"><h3>Statuts batch LTspice</h3>'
@@ -943,9 +1049,11 @@ def _render_top_categories(batch_counts: Dict[str, int]) -> str:
     fail = {k: v for k, v in batch_counts.items()
             if k.startswith("FAIL") or k in {"TIMEOUT", "EXEC_ERROR", "WARN_LOG"}}
     if not fail:
-        return ""
+        return ('<section id="top-cats"><h2>Top catégories d\'erreurs</h2>'
+                '<p class="no-data">Aucune erreur batch enregistrée (mode --no-batch ?).</p>'
+                '</section>')
     return (
-        '<section><h2>Top catégories d\'erreurs</h2>'
+        '<section id="top-cats"><h2>Top catégories d\'erreurs</h2>'
         + _bar_block(fail, total_override=sum(fail.values()), max_items=10)
         + '</section>'
     )
@@ -955,7 +1063,7 @@ def _render_inventory(counts_ext: Dict[str, int],
                       counts_model_type: Dict[str, int],
                       counts_pin_bin: Dict[str, int]) -> str:
     return (
-        '<section><h2>Inventaire (utile pour la réorganisation)</h2><div class="cols">'
+        '<section id="inventory"><h2>Inventaire (utile pour la réorganisation)</h2><div class="cols">'
         '<div class="col-card"><h3>Par extension</h3>'
         + _bar_block(counts_ext, ok_keys=set(), as_badge=False) +
         '</div><div class="col-card"><h3>Par type de modèle (.MODEL)</h3>'
@@ -968,7 +1076,7 @@ def _render_inventory(counts_ext: Dict[str, int],
 
 def _render_errored_files_table(err_rows: List[dict]) -> str:
     if not err_rows:
-        return ('<section><h2>Fichiers avec erreurs</h2>'
+        return ('<section id="errored"><h2>Fichiers avec erreurs</h2>'
                 '<p class="no-data">Aucun fichier en erreur. 🎉</p></section>')
     truncated = len(err_rows) > REPORT_MAX_TABLE_ROWS
     rows = err_rows[:REPORT_MAX_TABLE_ROWS]
@@ -987,7 +1095,7 @@ def _render_errored_files_table(err_rows: List[dict]) -> str:
     notice = (f'<div class="notice">Tableau tronqué à {REPORT_MAX_TABLE_ROWS} lignes '
               f'sur {len(err_rows)}. Consulte les CSV pour la liste complète.</div>') if truncated else ""
     return (
-        '<section><h2>Fichiers avec erreurs ' + f'({len(err_rows)})</h2>'
+        '<section id="errored"><h2>Fichiers avec erreurs ' + f'({len(err_rows)})</h2>'
         '<div class="toolbar">'
         '<input type="search" data-target="tbl-errored" placeholder="filtrer (chemin, statut, catégorie)...">'
         '<span class="count" data-for="tbl-errored"></span>'
@@ -1094,14 +1202,14 @@ def _render_per_file_detail(err_rows: List[dict],
         )
 
     if not cards:
-        return ('<section><h2>Detail par fichier</h2>'
+        return ('<section id="detail"><h2>Detail par fichier</h2>'
                 '<p class="no-data">Aucun fichier ne porte de detail ligne par ligne.</p></section>')
 
     notice = (f'<div class="notice">Cartes tronquees a {max_cards} sur {len(err_rows)} fichiers en erreur. '
               'Les details complets restent dans les CSV.</div>') if truncated else ""
 
     return (
-        '<section>'
+        '<section id="detail">'
         f'<h2>Detail par fichier — a corriger ({len(cards)})</h2>'
         '<p class="meta" style="margin-top:-.5rem">'
         'Clique sur un en-tete pour deplier la carte. Chaque carte liste les erreurs '
@@ -1121,7 +1229,7 @@ def _render_per_file_detail(err_rows: List[dict],
 
 def _render_static_issues_table(issues: List[dict]) -> str:
     if not issues:
-        return ('<section><h2>Issues statiques (prescan)</h2>'
+        return ('<section id="static-issues"><h2>Issues statiques (prescan)</h2>'
                 '<p class="no-data">Aucune issue statique.</p></section>')
     truncated = len(issues) > REPORT_MAX_TABLE_ROWS
     rows = issues[:REPORT_MAX_TABLE_ROWS]
@@ -1140,7 +1248,7 @@ def _render_static_issues_table(issues: List[dict]) -> str:
     notice = (f'<div class="notice">Tableau tronqué à {REPORT_MAX_TABLE_ROWS} lignes '
               f'sur {len(issues)}.</div>') if truncated else ""
     return (
-        '<section><h2>Issues statiques (prescan) ' + f'({len(issues)})</h2>'
+        '<section id="static-issues"><h2>Issues statiques (prescan) ' + f'({len(issues)})</h2>'
         '<div class="toolbar">'
         '<input type="search" data-target="tbl-static" placeholder="filtrer (catégorie, message, fichier)...">'
         '<span class="count" data-for="tbl-static"></span>'
@@ -1158,10 +1266,10 @@ def _render_batch_failures_table(batch: List[dict]) -> str:
              if b.get("status", "").startswith("FAIL")
              or b.get("status") in {"TIMEOUT", "EXEC_ERROR", "WARN_LOG", "UNKNOWN"}]
     if not batch:
-        return ('<section><h2>Échecs LTspice</h2>'
+        return ('<section id="batch"><h2>Échecs LTspice</h2>'
                 '<p class="no-data">Aucun test batch (mode --no-batch ?).</p></section>')
     if not fails:
-        return ('<section><h2>Échecs LTspice</h2>'
+        return ('<section id="batch"><h2>Échecs LTspice</h2>'
                 '<p class="no-data">Aucun échec côté LTspice. 🎉</p></section>')
     truncated = len(fails) > REPORT_MAX_TABLE_ROWS
     rows = fails[:REPORT_MAX_TABLE_ROWS]
@@ -1180,7 +1288,7 @@ def _render_batch_failures_table(batch: List[dict]) -> str:
     notice = (f'<div class="notice">Tableau tronqué à {REPORT_MAX_TABLE_ROWS} lignes '
               f'sur {len(fails)}.</div>') if truncated else ""
     return (
-        '<section><h2>Échecs LTspice ' + f'({len(fails)})</h2>'
+        '<section id="batch"><h2>Échecs LTspice ' + f'({len(fails)})</h2>'
         '<div class="toolbar">'
         '<input type="search" data-target="tbl-batch" placeholder="filtrer (statut, fichier, message)...">'
         '<span class="count" data-for="tbl-batch"></span>'
@@ -1305,8 +1413,9 @@ def generate_html_report(out_dir: Path) -> Optional[Path]:
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f'<title>Audit LTspice — Rapport</title><style>{REPORT_CSS}</style></head><body>'
     )
+    parts.append(_render_toc())
     parts.append(
-        f'<header><h1>Audit LTspice — rapport</h1>'
+        '<header class="audit-header"><h1>Audit LTspice — rapport</h1>'
         f'<p class="meta">Généré le {now} — dossier de sortie : <code>{_h(str(out_dir))}</code></p></header>'
     )
     parts.append(_render_overview_cards(n_files, n_subs, n_models, n_static, n_batch, n_batch_ok, n_batch_fail))
@@ -1319,6 +1428,7 @@ def generate_html_report(out_dir: Path) -> Optional[Path]:
     parts.append(_render_static_issues_table(static_issues))
     parts.append(_render_batch_failures_table(batch_results))
     parts.append('<footer>Rapport autonome — généré par ltspice_lib_auditor.py</footer>')
+    parts.append('<button class="back-to-top" id="back-to-top" type="button" title="Retour en haut">↑</button>')
     parts.append(f'<script>{REPORT_JS}</script></body></html>')
 
     out_path = out_dir / REPORT_FILENAME
@@ -1928,6 +2038,12 @@ def main() -> int:
         n_cached_b = len(cache.get("batch", {}))
         if n_cached_f or n_cached_b:
             print(f"[INFO] Cache charge    : {n_cached_f} fichier(s), {n_cached_b} test(s) batch.")
+        # Migration : requalifie les anciens faux positifs de la banniere LTspice
+        n_fixed = _migrate_cache_banner_false_positives(cache)
+        if n_fixed:
+            print(f"[INFO] Cache migration : {n_fixed} entree(s) requalifiee(s) "
+                  f"(banniere LTspice mal classee).")
+            save_cache(cache_path, cache)
 
     # ============================================================
     # PRESCAN PARALLELE (avec hits cache)
