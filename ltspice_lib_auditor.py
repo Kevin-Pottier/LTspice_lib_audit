@@ -27,6 +27,7 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -61,6 +62,14 @@ CACHE_SAVE_EVERY = 500  # sauve le cache toutes les N taches batch terminees
 
 REPORT_FILENAME = "report.html"
 REPORT_MAX_TABLE_ROWS = 10000  # tronque les tables au-dela (sinon HTML enorme)
+
+# Fix bundle (Vague 4) : paquet portable de sources + logs + JSON pour fix assiste
+BUNDLE_DIRNAME = "fix_bundle"
+BUNDLE_DEFAULT_MAX_FILES = 100      # cap par defaut du nb de fichiers embarques
+BUNDLE_MAX_SOURCE_SIZE = 1024 * 1024  # 1 MB max par fichier source copie
+BUNDLE_MAX_LOG_SIZE = 256 * 1024      # 256 KB max par log copie
+BUNDLE_LOG_HEAD_LINES = 5
+BUNDLE_LOG_TAIL_LINES = 40
 
 
 @dataclass
@@ -893,6 +902,17 @@ table.detail td { padding: .3rem .5rem; }
 .detail-actions { display: flex; gap: .5rem; align-items: center; margin-bottom: .5rem; flex-wrap: wrap; }
 .detail-actions button { padding: .25rem .6rem; border: 1px solid var(--border); background: #fff; cursor: pointer; border-radius: 4px; font-size: .82rem; }
 .detail-actions button:hover { background: #eef3f8; }
+.detail-actions button.active { background: var(--hdr); color: #fff; border-color: var(--hdr); }
+
+/* Checkbox "corrige" sur chaque carte fichier */
+.card-fix-label { display: inline-flex; align-items: center; gap: .25rem; font-size: .78rem; color: var(--muted); cursor: pointer; padding: 0 .35rem 0 0; user-select: none; }
+.card-fix-label:hover { color: var(--hdr); }
+.card-fix { cursor: pointer; margin: 0; transform: scale(1.1); }
+.file-card.fixed { opacity: .55; background: #f4f6f8; }
+.file-card.fixed .file-card-header { background: #e1e7ee; }
+.file-card.fixed .file-path { text-decoration: line-through; }
+.file-card.fixed .file-card-meta::after { content: " · corrigé"; color: var(--ok); font-weight: 600; }
+#fixed-counter { margin-left: auto; color: var(--ok); font-size: .85rem; font-weight: 600; }
 
 footer { margin-top: 2.5rem; color: var(--muted); font-size: .82rem; text-align: center; }
 """
@@ -950,24 +970,96 @@ document.querySelectorAll('.file-card-header').forEach(hdr => {
   });
 });
 
-// Filtre des cartes (par chemin de fichier)
+// Etat "fichiers corriges" persiste dans localStorage, scope par chemin du rapport
+const FIXED_STORAGE_KEY = 'ltspice_audit_fixed:' + (window.location.pathname || 'default');
+let hideFixed = false;
+
+function loadFixedState() {
+  try { return JSON.parse(localStorage.getItem(FIXED_STORAGE_KEY) || '{}'); }
+  catch (e) { return {}; }
+}
+function saveFixedState(state) {
+  try { localStorage.setItem(FIXED_STORAGE_KEY, JSON.stringify(state)); }
+  catch (e) { /* quota / private mode : on ignore */ }
+}
+function updateFixedCounter() {
+  const total = document.querySelectorAll('.card-fix').length;
+  const done = document.querySelectorAll('.file-card.fixed').length;
+  const counter = document.getElementById('fixed-counter');
+  if (counter && total > 0) {
+    counter.textContent = done + ' / ' + total + ' marques corriges';
+  }
+}
+
+// Unifie : visible <=> matche la recherche ET (pas hideFixed OU pas corrige)
+function updateDetailVisibility() {
+  const filterInput = document.getElementById('filter-detail');
+  const q = (filterInput ? filterInput.value : '').toLowerCase().trim();
+  let visible = 0;
+  document.querySelectorAll('.file-card').forEach(card => {
+    const path = (card.dataset.path || '').toLowerCase();
+    const cats = (card.dataset.cats || '').toLowerCase();
+    const matchSearch = !q || path.includes(q) || cats.includes(q);
+    const isFixed = card.classList.contains('fixed');
+    const show = matchSearch && !(hideFixed && isFixed);
+    card.style.display = show ? '' : 'none';
+    if (show) visible++;
+  });
+  const cnt = document.getElementById('filter-detail-count');
+  if (cnt) cnt.textContent = visible + ' visible(s)';
+}
+
 const detailFilter = document.getElementById('filter-detail');
 if (detailFilter) {
-  const updateDetail = () => {
-    const q = detailFilter.value.toLowerCase().trim();
-    let visible = 0;
-    document.querySelectorAll('.file-card').forEach(card => {
-      const path = (card.dataset.path || '').toLowerCase();
-      const cats = (card.dataset.cats || '').toLowerCase();
-      const show = !q || path.includes(q) || cats.includes(q);
-      card.style.display = show ? '' : 'none';
-      if (show) visible++;
+  detailFilter.addEventListener('input', updateDetailVisibility);
+}
+
+// Restaure l'etat coche depuis localStorage + cable les checkboxes
+const fixedState = loadFixedState();
+document.querySelectorAll('.card-fix').forEach(cb => {
+  const key = cb.dataset.key;
+  if (fixedState[key]) {
+    cb.checked = true;
+    cb.closest('.file-card').classList.add('fixed');
+  }
+  cb.addEventListener('change', () => {
+    const card = cb.closest('.file-card');
+    card.classList.toggle('fixed', cb.checked);
+    const state = loadFixedState();
+    if (cb.checked) state[key] = true;
+    else delete state[key];
+    saveFixedState(state);
+    updateFixedCounter();
+    if (hideFixed) updateDetailVisibility();
+  });
+});
+updateFixedCounter();
+updateDetailVisibility();
+
+// Bouton "Cacher les corriges" / "Afficher les corriges"
+const btnHideFixed = document.getElementById('btn-hide-fixed');
+if (btnHideFixed) {
+  btnHideFixed.addEventListener('click', () => {
+    hideFixed = !hideFixed;
+    btnHideFixed.classList.toggle('active', hideFixed);
+    btnHideFixed.textContent = hideFixed ? 'Afficher les corriges' : 'Cacher les corriges';
+    updateDetailVisibility();
+  });
+}
+
+// Bouton "Tout decocher"
+const btnUnfixAll = document.getElementById('btn-unfix-all');
+if (btnUnfixAll) {
+  btnUnfixAll.addEventListener('click', () => {
+    if (!confirm('Decocher TOUTES les cases "corrige" pour ce rapport ?')) return;
+    saveFixedState({});
+    document.querySelectorAll('.card-fix').forEach(cb => {
+      cb.checked = false;
+      cb.closest('.file-card').classList.remove('fixed');
     });
-    const cnt = document.getElementById('filter-detail-count');
-    if (cnt) cnt.textContent = visible + ' visible(s)';
-  };
-  detailFilter.addEventListener('input', updateDetail);
-  updateDetail();
+    updateFixedCounter();
+    updateDetailVisibility();
+  });
 }
 
 // Boutons "tout ouvrir / tout fermer"
@@ -1187,10 +1279,20 @@ def _render_per_file_detail(err_rows: List[dict],
         else:
             fail_html = '<p class="no-data" style="margin:.2rem 0">Aucun echec LTspice (que des issues statiques).</p>'
 
+        # Checkbox "corrige" : data-key = rel_path (stable entre regen), stop
+        # propagation pour que le clic n'ouvre/ferme pas la carte
+        checkbox_html = (
+            '<label class="card-fix-label" title="Cocher quand ce fichier a ete corrige" '
+            'onclick="event.stopPropagation()">'
+            f'<input type="checkbox" class="card-fix" data-key="{_h(rel)}">'
+            'corrige'
+            '</label>'
+        )
         cards.append(
             '<div class="file-card collapsed" '
             f'data-path="{_h(rel.lower())}" data-cats="{_h(cats.lower())}">'
             '<div class="file-card-header">'
+            + checkbox_html +
             f'<span class="file-path">{_h(rel)}</span> '
             f'<span class="status {_h(status)}">{_h(status) or "—"}</span>'
             f'<span class="file-card-meta">{_h(ext)} · {len(issues_sorted)} issue(s) · {len(fails)} echec(s) LTspice</span>'
@@ -1220,6 +1322,9 @@ def _render_per_file_detail(err_rows: List[dict],
         '<span class="count" id="filter-detail-count" style="color:#666;font-size:.85rem"></span>'
         '<button id="btn-expand-all" type="button">Tout ouvrir</button>'
         '<button id="btn-collapse-all" type="button">Tout fermer</button>'
+        '<button id="btn-hide-fixed" type="button" title="Masque les fichiers coches">Cacher les corriges</button>'
+        '<button id="btn-unfix-all" type="button" title="Decoche toutes les cases (avec confirmation)">Tout decocher</button>'
+        '<span id="fixed-counter"></span>'
         '</div>'
         + notice +
         '<div id="file-cards">' + "".join(cards) + '</div>'
@@ -1434,6 +1539,403 @@ def generate_html_report(out_dir: Path) -> Optional[Path]:
     out_path = out_dir / REPORT_FILENAME
     out_path.write_text("".join(parts), encoding="utf-8")
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Fix bundle (Vague 4) : paquet portable pour fix assiste par Claude / humain
+# ---------------------------------------------------------------------------
+
+def _is_likely_encrypted(content: bytes) -> bool:
+    """
+    Heuristique : detecte si un fichier LTspice est probablement chiffre.
+    Critere 1 : marqueur explicite "ENCRYPTED" / "*KSh" dans les 5 1res lignes.
+    Critere 2 : ratio de bytes imprimables < 65 % dans les 2 premiers Ko.
+    Conservateur : prefere un faux positif a partager du contenu chiffre inutile.
+    """
+    if not content:
+        return False
+    head = content[:2048]
+    try:
+        head_text = head.decode("latin-1", errors="replace")
+    except Exception:
+        return True
+    for ln in head_text.splitlines()[:5]:
+        ls = ln.strip()
+        if "ENCRYPTED" in ls.upper():
+            return True
+        if ls.upper().startswith("*KSH"):
+            return True
+    printable = sum(1 for b in head if 32 <= b < 127 or b in (9, 10, 13))
+    return (printable / len(head)) < 0.65
+
+
+def _classify_confidence(prescan_status: str,
+                         static_categories: set,
+                         batch_statuses: set,
+                         is_encrypted: bool) -> str:
+    """
+    Decide d'un niveau de confiance pour la correction automatique :
+    - high       : mecanique, deterministe (ex: .ENDS manquant, INCLUDE resolvable)
+    - medium     : probablement corrigeable, a verifier
+    - low        : necessite contexte / datasheet (semantique modele, pin count)
+    - manual_only: trop ambigu (TIMEOUT, FATAL, chiffre)
+    """
+    if is_encrypted:
+        return "manual_only"
+    if batch_statuses & {"TIMEOUT", "FAIL_FATAL", "EXEC_ERROR"}:
+        return "manual_only"
+
+    high_static = {"ENDS", "SUBCKT"}
+    medium_static = {"TABLE", "PARENS_FILE", "PARENS_LINE"}
+
+    if static_categories and static_categories.issubset(high_static) and not batch_statuses:
+        return "high"
+    if batch_statuses and batch_statuses.issubset({"FAIL_INCLUDE"}):
+        return "high"
+    if prescan_status == "READ_ERROR":
+        return "medium"
+    if static_categories and static_categories.issubset(high_static | medium_static):
+        return "medium"
+    if batch_statuses & {"FAIL_SYNTAX", "FAIL_MISSING_SUBCKT"}:
+        return "medium"
+    if batch_statuses & {"FAIL_SUBCKT", "FAIL_PINCOUNT", "FAIL_OTHER", "WARN_LOG"}:
+        return "low"
+    return "low"
+
+
+def _build_bundle_manifest(data: dict) -> str:
+    n = data.get("total_files_in_bundle", 0)
+    counts_conf: Dict[str, int] = {}
+    counts_status: Dict[str, int] = {}
+    for e in data.get("files", []):
+        c = e.get("confidence_auto_fix", "")
+        counts_conf[c] = counts_conf.get(c, 0) + 1
+        s = e.get("prescan_status", "")
+        counts_status[s] = counts_status.get(s, 0) + 1
+    conf_lines = "\n".join(f"- `{k}` : {v}" for k, v in sorted(counts_conf.items())) or "- (vide)"
+    status_lines = "\n".join(f"- `{k}` : {v}" for k, v in sorted(counts_status.items())) or "- (vide)"
+    truncated = data.get("truncated_at_max_files", False)
+    trunc_note = ""
+    if truncated:
+        trunc_note = (f"\n> Bundle tronque (cap={data.get('max_files_cap','?')}). "
+                      f"Total eligible : {data.get('total_errored_files','?')}. "
+                      f"Augmente `--bundle-max-files` pour ratisser plus.\n")
+    skipped = data.get("skipped_by_min_confidence", 0)
+    skip_note = ""
+    if skipped:
+        skip_note = (f"\n> {skipped} fichier(s) ignore(s) par "
+                     f"`--bundle-min-confidence {data.get('min_confidence_filter','?')}`.\n")
+
+    return textwrap.dedent(f"""\
+    # Fix Bundle - LTspice Library Auditor
+
+    Genere le **{data.get('generated_at','?')}**
+    Audit racine : `{data.get('audit_root','?')}`
+
+    **{n}** fichier(s) inclus dans ce bundle.{trunc_note}{skip_note}
+
+    ## Repartition par niveau de confiance auto-fix
+
+    {conf_lines}
+
+    ## Repartition par statut prescan
+
+    {status_lines}
+
+    ## Comment utiliser ce bundle avec Claude
+
+    1. Compresse le dossier `fix_bundle/` en zip et partage-le dans une
+       conversation Claude (ou colle directement le contenu de `errors.json`
+       avec les fichiers de `sources/`).
+    2. Demande : *"Voici un bundle d'erreurs LTspice. Corrige d'abord la
+       confiance `high`, puis `medium`. Pour chaque fichier, donne-moi la
+       version corrigee complete dans un bloc de code."*
+    3. Recupere les fichiers corriges, ecrase tes originaux.
+    4. Relance : `python ltspice_lib_auditor.py --root ... --out ...`
+       Le cache ne retest que les fichiers modifies.
+
+    ## Structure
+
+    | Element                | Contenu                                                              |
+    |------------------------|----------------------------------------------------------------------|
+    | `errors.json`          | Donnees structurees (a partager en premier)                          |
+    | `MANIFEST.md`          | Ce fichier                                                           |
+    | `bundle_summary.txt`   | 1 ligne par fichier, lisible humain                                  |
+    | `sources/`             | Copies 1:1 des fichiers en erreur (arborescence preservee)           |
+    | `logs/`                | Logs LTspice complets (cible des `raw_log_path` des batch_results)   |
+
+    ## Niveaux de confiance
+
+    | Niveau         | Description                                                                            |
+    |----------------|----------------------------------------------------------------------------------------|
+    | `high`         | Correction mecanique (`.ENDS` manquant, `FAIL_INCLUDE` resolvable dans la lib)         |
+    | `medium`       | Probablement corrigeable mais a verifier manuellement                                  |
+    | `low`          | Necessite contexte / datasheet (FAIL_SUBCKT semantique, FAIL_PINCOUNT, FAIL_OTHER...)  |
+    | `manual_only`  | Trop ambigu (TIMEOUT, FATAL, fichier chiffre)                                          |
+
+    ## Recommandation de batch
+
+    - 50-100 fichiers `high` -> 1 conversation
+    - 30-50 `medium` -> 1 conversation
+    - `low` / `manual_only` -> cas par cas
+
+    ## Avertissement
+
+    Tu es responsable du contenu que tu partages. Verifie que ta lib n'a pas
+    de licence interdisant la redistribution avant de la partager exterieurement.
+    Les fichiers chiffres ne sont pas copies dans `sources/`.
+    """)
+
+
+def generate_fix_bundle(out_dir: Path,
+                        max_files: int = BUNDLE_DEFAULT_MAX_FILES,
+                        min_confidence: str = "low") -> Optional[Path]:
+    """
+    Genere un dossier portable {out_dir}/fix_bundle/ avec :
+    - sources/   : copies des fichiers en erreur (arborescence preservee)
+    - logs/      : copies integrales des logs LTspice associes
+    - errors.json: structure de donnees pour reprise par un assistant
+    - MANIFEST.md: explications pour humain
+    - bundle_summary.txt: liste 1-ligne-par-fichier
+    """
+    reports_dir = out_dir / "reports"
+    if not reports_dir.exists():
+        print(f"[WARN] {reports_dir} introuvable, bundle non genere.")
+        return None
+
+    summaries = _read_csv_dicts(reports_dir / "files_summary.csv")
+    static_issues = _read_csv_dicts(reports_dir / "static_issues.csv")
+    batch_results = _read_csv_dicts(reports_dir / "batch_results.csv")
+
+    issues_by_path: Dict[str, List[dict]] = {}
+    for it in static_issues:
+        issues_by_path.setdefault(it.get("file_path", ""), []).append(it)
+    batch_by_path: Dict[str, List[dict]] = {}
+    for b in batch_results:
+        batch_by_path.setdefault(b.get("file_path", ""), []).append(b)
+    sm_by_path = {s.get("file_path", ""): s for s in summaries}
+
+    errored: set = set()
+    for s in summaries:
+        if s.get("status") in {"SUSPECT", "BROKEN_LIKELY", "READ_ERROR"}:
+            errored.add(s.get("file_path", ""))
+    for it in static_issues:
+        errored.add(it.get("file_path", ""))
+    for b in batch_results:
+        st = b.get("status", "")
+        if st.startswith("FAIL") or st in {"TIMEOUT", "EXEC_ERROR", "WARN_LOG"}:
+            errored.add(b.get("file_path", ""))
+    errored.discard("")
+
+    if not errored:
+        print("[INFO] Aucun fichier en erreur, bundle non genere.")
+        return None
+
+    bundle_dir = out_dir / BUNDLE_DIRNAME
+    if bundle_dir.exists():
+        try:
+            shutil.rmtree(bundle_dir)
+        except Exception as exc:
+            print(f"[WARN] Nettoyage bundle precedent echoue: {exc}")
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    sources_dir = bundle_dir / "sources"
+    logs_dir = bundle_dir / "logs"
+    sources_dir.mkdir(exist_ok=True)
+    logs_dir.mkdir(exist_ok=True)
+
+    conf_order = {"high": 0, "medium": 1, "low": 2, "manual_only": 3}
+    min_idx = conf_order.get(min_confidence, 9)
+
+    entries: List[dict] = []
+    skipped_confidence = 0
+
+    for fp in errored:
+        s = sm_by_path.get(fp, {})
+        issues = issues_by_path.get(fp, [])
+        fails = [b for b in batch_by_path.get(fp, [])
+                 if b.get("status", "").startswith("FAIL")
+                 or b.get("status") in {"TIMEOUT", "EXEC_ERROR", "WARN_LOG"}]
+        if not issues and not fails:
+            continue
+
+        src_path = Path(fp)
+        head_bytes = b""
+        is_encrypted = False
+        too_big = False
+        try:
+            if src_path.exists():
+                too_big = src_path.stat().st_size > BUNDLE_MAX_SOURCE_SIZE
+                with src_path.open("rb") as f:
+                    head_bytes = f.read(2048)
+            is_encrypted = _is_likely_encrypted(head_bytes)
+        except Exception:
+            pass
+
+        static_cats = {it.get("category", "") for it in issues}
+        batch_sts = {b.get("status", "") for b in fails}
+        confidence = _classify_confidence(s.get("status", ""), static_cats,
+                                          batch_sts, is_encrypted)
+
+        if conf_order.get(confidence, 9) > min_idx:
+            skipped_confidence += 1
+            continue
+
+        rel = s.get("rel_path", fp)
+        rel_norm = rel.replace("\\", "/")
+
+        entry: dict = {
+            "rel_path": rel,
+            "rel_path_unix": rel_norm,
+            "source_path_original": fp,
+            "source_in_bundle": "",
+            "prescan_status": s.get("status", ""),
+            "extension": s.get("extension", ""),
+            "encoding": s.get("encoding", ""),
+            "confidence_auto_fix": confidence,
+            "is_encrypted": is_encrypted,
+            "too_big_to_bundle": too_big,
+            "static_issues": [
+                {
+                    "line_no": it.get("line_no", ""),
+                    "severity": it.get("severity", ""),
+                    "category": it.get("category", ""),
+                    "message": it.get("message", ""),
+                    "excerpt": it.get("excerpt", ""),
+                }
+                for it in issues
+            ],
+            "batch_failures": [],
+            "notes": [],
+        }
+
+        # Copie source
+        if is_encrypted:
+            entry["notes"].append("Fichier probablement chiffre - non copie.")
+        elif too_big:
+            entry["notes"].append(
+                f"Fichier > {BUNDLE_MAX_SOURCE_SIZE // 1024} Ko - non copie."
+            )
+        elif not src_path.exists():
+            entry["notes"].append("Fichier source introuvable au moment du bundling.")
+        else:
+            target_src = sources_dir / rel_norm
+            try:
+                target_src.parent.mkdir(parents=True, exist_ok=True)
+                target_src.write_bytes(src_path.read_bytes())
+                entry["source_in_bundle"] = f"sources/{rel_norm}"
+            except Exception as exc:
+                entry["notes"].append(f"Copie source impossible : {exc}")
+
+        # Logs LTspice
+        for b in fails:
+            fail_entry = {
+                "target_kind": b.get("target_kind", ""),
+                "target_name": b.get("target_name", ""),
+                "status": b.get("status", ""),
+                "exit_code": b.get("exit_code", ""),
+                "error_summary": b.get("error_summary", ""),
+                "log_excerpt": "",
+                "log_in_bundle": "",
+            }
+            raw_log = b.get("raw_log_path", "")
+            if raw_log:
+                src_log = Path(raw_log)
+                if src_log.exists():
+                    try:
+                        if src_log.stat().st_size > BUNDLE_MAX_LOG_SIZE:
+                            full_text = src_log.read_text(encoding="utf-8", errors="replace")
+                            log_text = (
+                                "... [debut tronque, log > "
+                                f"{BUNDLE_MAX_LOG_SIZE // 1024} Ko] ...\n"
+                                + full_text[-BUNDLE_MAX_LOG_SIZE:]
+                            )
+                        else:
+                            log_text = src_log.read_text(encoding="utf-8", errors="replace")
+                        lines = log_text.splitlines()
+                        if len(lines) > (BUNDLE_LOG_HEAD_LINES + BUNDLE_LOG_TAIL_LINES + 1):
+                            excerpt = "\n".join(
+                                lines[:BUNDLE_LOG_HEAD_LINES]
+                                + ["... [troncature] ..."]
+                                + lines[-BUNDLE_LOG_TAIL_LINES:]
+                            )
+                        else:
+                            excerpt = log_text
+                        fail_entry["log_excerpt"] = excerpt
+                        log_filename = src_log.name
+                        target_log = logs_dir / log_filename
+                        target_log.write_text(log_text, encoding="utf-8")
+                        fail_entry["log_in_bundle"] = f"logs/{log_filename}"
+                    except Exception as exc:
+                        fail_entry["log_excerpt"] = (
+                            f"(impossible de lire {raw_log} : {exc})"
+                        )
+            entry["batch_failures"].append(fail_entry)
+
+        entries.append(entry)
+
+    # Tri : confiance haute d'abord, puis chemin
+    entries.sort(key=lambda e: (conf_order.get(e["confidence_auto_fix"], 9),
+                                 e["rel_path"]))
+
+    total_eligible = len(entries) + skipped_confidence
+    truncated = len(entries) > max_files
+    if truncated:
+        entries = entries[:max_files]
+
+    bundle_data = {
+        "audit_root": str(out_dir),
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_files_in_bundle": len(entries),
+        "total_errored_files": total_eligible,
+        "skipped_by_min_confidence": skipped_confidence,
+        "truncated_at_max_files": truncated,
+        "min_confidence_filter": min_confidence,
+        "max_files_cap": max_files,
+        "files": entries,
+    }
+
+    (bundle_dir / "errors.json").write_text(
+        json.dumps(bundle_data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (bundle_dir / "MANIFEST.md").write_text(
+        _build_bundle_manifest(bundle_data), encoding="utf-8"
+    )
+
+    summary_lines = [
+        f"# Fix Bundle - {len(entries)} fichier(s)",
+        f"# Confidence min : {min_confidence} | Cap : {max_files} | "
+        f"Tronque : {truncated} | Total eligible : {total_eligible}",
+        "",
+    ]
+    for e in entries:
+        flag = ""
+        if e["is_encrypted"]:
+            flag = " [ENC]"
+        elif e["too_big_to_bundle"]:
+            flag = " [BIG]"
+        elif not e["source_in_bundle"]:
+            flag = " [NO-SRC]"
+        summary_lines.append(
+            f"[{e['confidence_auto_fix']:<11}] "
+            f"{e['rel_path']:<48} "
+            f"{e['prescan_status']:<13} "
+            f"{len(e['static_issues']):>3} stat, "
+            f"{len(e['batch_failures']):>3} batch"
+            f"{flag}"
+        )
+    (bundle_dir / "bundle_summary.txt").write_text(
+        "\n".join(summary_lines) + "\n", encoding="utf-8"
+    )
+
+    print(f"[OK] Fix bundle genere : {bundle_dir}")
+    print(f"      {len(entries)} fichier(s) embarques, "
+          f"confiance >= {min_confidence}")
+    if truncated:
+        print(f"      Tronque : {total_eligible} eligibles, cap a {max_files}.")
+    if skipped_confidence:
+        print(f"      Ignores par filtre confiance : {skipped_confidence}")
+    return bundle_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1972,6 +2474,16 @@ def main() -> int:
                         help="Ne genere pas le rapport HTML en fin d'audit")
     parser.add_argument("--report-only", action="store_true",
                         help="Regenere uniquement le rapport HTML depuis les CSV existants (pas d'audit)")
+    parser.add_argument("--fix-bundle", action="store_true",
+                        help="Genere un fix_bundle/ a la fin (sources + logs + JSON pour fix assiste)")
+    parser.add_argument("--fix-bundle-only", action="store_true",
+                        help="Genere uniquement le fix_bundle depuis les CSV existants (pas d'audit)")
+    parser.add_argument("--bundle-max-files", type=int, default=BUNDLE_DEFAULT_MAX_FILES,
+                        help=f"Cap du nb de fichiers dans le bundle (defaut {BUNDLE_DEFAULT_MAX_FILES})")
+    parser.add_argument("--bundle-min-confidence",
+                        choices=["high", "medium", "low", "manual_only"],
+                        default="low",
+                        help="Niveau de confiance minimum pour inclure un fichier (defaut low = tout sauf manual_only)")
     parser.add_argument("--group-size", type=int, default=20,
                         help="Sous-circuits regroupes par deck pour amortir le startup LTspice "
                              "(defaut 20 ; 1 = desactive). Les groupes qui echouent sont retestes individuellement.")
@@ -1998,6 +2510,14 @@ def main() -> int:
             print(f"[OK] Rapport regenere : {p}")
             return 0
         return 2
+
+    # Mode --fix-bundle-only : skip audit, regen bundle depuis CSV existants
+    if args.fix_bundle_only:
+        if not (out / "reports").exists():
+            print(f"[ERREUR] {out / 'reports'} introuvable. Lance d'abord un audit complet.")
+            return 2
+        p = generate_fix_bundle(out, args.bundle_max_files, args.bundle_min_confidence)
+        return 0 if p else 1
 
     if not args.root:
         print("[ERREUR] --root est requis (sauf en mode --report-only).")
@@ -2572,6 +3092,12 @@ def main() -> int:
                 print(f"[INFO] Rapport HTML : {p}")
         except Exception as exc:
             print(f"[WARN] Generation du rapport HTML echouee: {type(exc).__name__}: {exc}")
+
+    if args.fix_bundle:
+        try:
+            generate_fix_bundle(out, args.bundle_max_files, args.bundle_min_confidence)
+        except Exception as exc:
+            print(f"[WARN] Generation fix bundle echouee: {type(exc).__name__}: {exc}")
 
     print(f"[OK] Audit termine. Rapports dans : {out}")
     return 0

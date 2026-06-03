@@ -37,6 +37,15 @@ LTspice Library Auditor - mode d'emploi rapide
     plus simple a tracer) :
    python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --group-size 1
 
+13) Generer un fix bundle a partager (avec Claude par exemple) :
+   python ltspice_lib_auditor.py --root "..." --out "C:\Temp\lt_audit" --fix-bundle
+   # ou depuis un audit deja realise :
+   python ltspice_lib_auditor.py --out "C:\Temp\lt_audit" --fix-bundle-only
+
+14) Bundle limite aux corrections deterministes (.ENDS manquant, INCLUDE...) :
+   python ltspice_lib_auditor.py --out "C:\Temp\lt_audit" --fix-bundle-only \
+       --bundle-min-confidence high --bundle-max-files 80
+
 Options principales :
 - -j N / --jobs N        : nb de processus paralleles (defaut auto = cpu-1)
 - --timeout N            : timeout LTspice en secondes (defaut 15)
@@ -50,6 +59,10 @@ Options principales :
 - --no-report            : pas de rapport HTML en fin d'audit
 - --report-only          : regenere uniquement report.html depuis les CSV
 - --gui                  : lance l'interface graphique Tkinter
+- --fix-bundle           : genere fix_bundle/ a la fin de l'audit
+- --fix-bundle-only      : regenere uniquement le bundle depuis les CSV existants
+- --bundle-max-files N   : cap du nb de fichiers dans le bundle (defaut 100)
+- --bundle-min-confidence : high | medium | low | manual_only (defaut low)
 
 Sorties importantes :
 - reports/files_summary.csv
@@ -60,6 +73,7 @@ Sorties importantes :
 - reports/batch_results.csv
 - README_AUDIT.txt
 - report.html         (rapport interactif filtrable, ouvre dans un navigateur)
+- fix_bundle/         (genere si --fix-bundle ; pret a partager)
 - .audit_cache.json   (cache : evite de retester ce qui n'a pas bouge)
 
 Rapport HTML (report.html) :
@@ -103,3 +117,25 @@ Interface graphique (--gui) :
 - Bouton Arreter qui sauve le cache avant de tuer le process
 - Boutons "Ouvrir rapport HTML" et "Ouvrir dossier sortie"
 - Reglages persistes dans ~/.ltspice_audit_gui_settings.json
+
+Fix bundle (--fix-bundle) :
+- Genere un dossier portable {out}/fix_bundle/ contenant :
+  - sources/         : copies 1:1 des fichiers en erreur, arborescence preservee
+  - logs/            : logs LTspice complets pour chaque echec batch
+  - errors.json      : donnees structurees (chemin, categorie, log_excerpt,
+                       confiance auto-fix par fichier)
+  - MANIFEST.md      : explications + workflow recommande
+  - bundle_summary.txt : 1 ligne par fichier, lisible humain
+- Niveaux de confiance assignes automatiquement :
+  - high          : correction mecanique (.ENDS manquant, FAIL_INCLUDE...)
+  - medium        : probablement corrigeable, a verifier
+  - low           : necessite contexte / datasheet
+  - manual_only   : TIMEOUT, FATAL, fichiers chiffres (heuristique conservatrice)
+- Fichiers chiffres : detectes par marqueur ENCRYPTED ou ratio binaire eleve,
+  NON copies dans sources/ (mais listes dans errors.json avec note).
+- Fichiers > 1 Mo : non copies par defaut (note ajoutee).
+- Workflow recommande :
+  1. python ltspice_lib_auditor.py --out ... --fix-bundle-only
+                                   --bundle-min-confidence high
+  2. zip fix_bundle/ -> partage avec Claude
+  3. Applique les fichiers corriges, relance l'audit, le cache fait le reste.
