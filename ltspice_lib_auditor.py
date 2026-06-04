@@ -555,36 +555,82 @@ def read_possible_log(cir_path: Path) -> Tuple[str, Optional[Path]]:
 
 LTSPICE_BANNER_RE = re.compile(r'^\s*LTspice\s+\S+\s+for\s+', re.IGNORECASE)
 
-# Patterns "innocents" : lignes qui peuvent apparaitre dans un log LTspice
-# meme en cas de succes (banniere, copyright, infos solveur, commentaires SPICE...).
-# Si le log ne contient QUE ces lignes, on considere le run OK.
-INNOCUOUS_LINE_PATTERNS = [
-    LTSPICE_BANNER_RE,
-    re.compile(r'^\s*Copyright\s*\(c\)', re.IGNORECASE),
-    re.compile(r'^\s*Direct Newton iteration', re.IGNORECASE),
-    re.compile(r'^\s*Total elapsed time', re.IGNORECASE),
-    re.compile(r'^\s*tnom\s*=', re.IGNORECASE),
-    re.compile(r'^\s*temp\s*=', re.IGNORECASE),
-    re.compile(r'^\s*method\s*=', re.IGNORECASE),
-    re.compile(r'^\s*Date:', re.IGNORECASE),
-    re.compile(r'^\s*Maximum thread count', re.IGNORECASE),
-    re.compile(r'^\s*Matrix Compiler', re.IGNORECASE),
-    re.compile(r'^\s*Solver:', re.IGNORECASE),
-    re.compile(r'^\s*BypassMode', re.IGNORECASE),
-    re.compile(r'^\s*\*'),       # commentaire SPICE
-    re.compile(r'^\s*$'),        # ligne vide
-]
+# Lignes d'entete/info BENIGNES : presentes dans TOUT log LTspice, meme en cas
+# de succes complet. Sert uniquement a reconnaitre un resume "non-erreur" lors
+# de la migration du cache. La classification (classify_log) n'en depend pas :
+# elle utilise une detection POSITIVE des erreurs (cf. ci-dessous).
+LTSPICE_BENIGN_HEADER_RE = re.compile(
+    r'^\s*('
+    r'LTspice\s+\S+\s+for\b'           # "LTspice 26.0.1 for Windows"
+    r'|Circuit\s*:'                     # "Circuit: C:\...cir"
+    r'|Start Time\s*:'                  # "Start Time: Wed Jun 3 ..."
+    r'|Date\s*:'
+    r'|solver\s*='                      # "solver = Normal"
+    r'|Maximum thread count'
+    r'|Matrix Compiler'
+    r'|Reduced\b'                       # "Reduced ... to N nodes"
+    r'|Total elapsed time'
+    r'|Direct Newton iteration'
+    r'|tnom\s*='
+    r'|temp\s*='
+    r'|method\s*='
+    r'|BypassMode'
+    r'|Copyright'
+    r'|Compilation time'
+    r'|Pass\s+\d'
+    r'|\*'                              # commentaire SPICE
+    r')',
+    re.IGNORECASE,
+)
+
+# Detection POSITIVE d'une vraie erreur. Deux signaux fiables :
+# 1) le format LTspice "fichier(NNN): message"  -> toute erreur de parse/elaboration
+# 2) un mot-cle d'erreur runtime sans numero de ligne (fatal, singular, etc.)
+LTSPICE_FILE_ERROR_RE = re.compile(r'\(\d+\)\s*:\s*\S')
+LTSPICE_RUNTIME_ERROR_RE = re.compile(
+    r'\b('
+    r'fatal error|singular matrix|no dc (analysis )?path|timestep too small'
+    r'|iteration limit|convergence (fail|problem)|analysis failed'
+    r'|unknown subcircuit|cannot be instantiated|too few nodes|too many nodes'
+    r'|more than one sub-?circuit|undefined model|no such parameter'
+    r'|missing\b.*\bparameter|multiple definition|already defined'
+    r'|syntax error|unexpected input'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Notes BENIGNES : LTspice signale qqch mais charge/simule quand meme. Pour un
+# audit "le composant fonctionne-t-il ?", ce ne sont PAS des echecs.
+LTSPICE_BENIGN_NOTE_RE = re.compile(
+    r'((?:^|:\s*)Note\s*:'              # "...(54): Note: The caret character means XOR..."
+    r'|may or may not be a problem'     # "Ignoring unknown model parameter. This may..."
+    r'|will be ignored'                 # "Ncycles must be positive, will be ignored"
+    r'|Missing value, assuming'         # assomption de valeur par defaut
+    r'|assuming .*@ DC'
+    r'|has zero rise/fall'              # avertissement timing A-device, simule quand meme
+    r')',
+    re.IGNORECASE,
+)
 
 
-def _strip_innocuous_lines(text: str) -> str:
+def _first_real_error_line(text: str) -> Optional[str]:
+    """Retourne la 1re ligne indiquant une VRAIE erreur LTspice, sinon None.
+    Robuste face a l'entete benin (banniere, Circuit:, Start Time:, solver=...)
+    ET aux notes informatives (Note:, 'may or may not be a problem', ...) que
+    LTspice emet sans empecher le chargement du composant."""
     if not text:
-        return ""
-    keep = []
-    for line in text.splitlines():
-        if any(p.match(line) for p in INNOCUOUS_LINE_PATTERNS):
+        return None
+    for raw in text.splitlines():
+        ln = raw.strip()
+        if not ln:
             continue
-        keep.append(line)
-    return "\n".join(keep).strip()
+        if LTSPICE_BENIGN_HEADER_RE.match(ln):
+            continue
+        if LTSPICE_BENIGN_NOTE_RE.search(ln):
+            continue
+        if LTSPICE_FILE_ERROR_RE.search(ln) or LTSPICE_RUNTIME_ERROR_RE.search(ln):
+            return ln
+    return None
 
 
 def classify_log(log_text: str, stderr: str, exit_code: int) -> Tuple[str, str]:
@@ -594,15 +640,17 @@ def classify_log(log_text: str, stderr: str, exit_code: int) -> Tuple[str, str]:
         return "OK", ""
 
     lower = text.lower()
-    # Patterns d'erreur specifiques d'abord (priorite sur le strip de banniere)
+    # Categories specifiques (donnent un libelle d'erreur parlant)
     if "expected \")\"" in lower:
         return "FAIL_SYNTAX", 'Expected ")"'
-    if "syntax error" in lower:
+    if "syntax error" in lower or "unexpected input" in lower:
         return "FAIL_SYNTAX", "Syntax error"
     if "cannot be instantiated" in lower:
         return "FAIL_SUBCKT", "Subcircuit cannot be instantiated"
     if "unknown subcircuit called" in lower:
         return "FAIL_MISSING_SUBCKT", "Unknown subcircuit called"
+    if "no such parameter" in lower:
+        return "FAIL_PARAM", "No such parameter defined"
     if "file not found" in lower:
         return "FAIL_INCLUDE", "Included file not found"
     if "too few nodes" in lower or "too many nodes" in lower:
@@ -610,34 +658,33 @@ def classify_log(log_text: str, stderr: str, exit_code: int) -> Tuple[str, str]:
     if "fatal error" in lower:
         return "FAIL_FATAL", "Fatal error"
 
-    # Aucun pattern d'erreur connu. Strip des lignes innocentes (banniere,
-    # copyright, commentaires) et regarde s'il reste qqchose de non trivial.
-    text_clean = _strip_innocuous_lines(text)
-    if not text_clean:
+    # Detection POSITIVE : y a-t-il une vraie ligne d'erreur ?
+    # Si non -> le log ne contient que l'entete benin -> SUCCES.
+    err_line = _first_real_error_line(text)
+    if err_line is None:
         return "OK", ""
 
     if exit_code != 0:
-        return "FAIL_OTHER", text_clean.splitlines()[0][:240]
-    if exit_code == 0:
-        return "WARN_LOG", text_clean.splitlines()[0][:240]
-    return "UNKNOWN", ""
+        return "FAIL_OTHER", err_line[:240]
+    return "WARN_LOG", err_line[:240]
 
 
 def _migrate_cache_banner_false_positives(cache: dict) -> int:
     """
-    Requalifie les entrees deja en cache classees WARN_LOG/FAIL_OTHER alors que
-    le error_summary contient juste la banniere LTspice. Idempotent.
+    Requalifie en OK les entrees deja en cache classees WARN_LOG/FAIL_OTHER dont
+    le error_summary n'est PAS une vraie ligne d'erreur (banniere, Circuit:,
+    Start Time:, solver=..., etc.). Idempotent. Spare un re-run complet.
     Retourne le nombre d'entrees corrigees.
     """
     fixed = 0
     for entry in cache.get("batch", {}).values():
         if not isinstance(entry, dict):
             continue
-        status = entry.get("status", "")
-        summary = entry.get("error_summary", "") or ""
-        if status not in {"WARN_LOG", "FAIL_OTHER"}:
+        if entry.get("status", "") not in {"WARN_LOG", "FAIL_OTHER"}:
             continue
-        if LTSPICE_BANNER_RE.match(summary):
+        summary = (entry.get("error_summary", "") or "").strip()
+        # OK si vide, ou si ce n'est pas une vraie ligne d'erreur reconnue
+        if summary == "" or _first_real_error_line(summary) is None:
             entry["status"] = "OK"
             entry["error_summary"] = ""
             fixed += 1
@@ -752,6 +799,7 @@ def _build_recommendations(prescan_counts: Dict[str, int],
     fi = batch_counts.get("FAIL_INCLUDE", 0)
     fsub = batch_counts.get("FAIL_SUBCKT", 0)
     fpin = batch_counts.get("FAIL_PINCOUNT", 0)
+    fpar = batch_counts.get("FAIL_PARAM", 0)
     fmis = batch_counts.get("FAIL_MISSING_SUBCKT", 0)
     ffat = batch_counts.get("FAIL_FATAL", 0)
     fto = batch_counts.get("TIMEOUT", 0)
@@ -766,6 +814,8 @@ def _build_recommendations(prescan_counts: Dict[str, int],
         recs.append(f"{fsub} FAIL_SUBCKT — sous-circuits non instanciables. Souvent : interface mal détectée ou pin introuvable.")
     if fpin:
         recs.append(f"{fpin} FAIL_PINCOUNT — nombre de pins entre déclaration et instanciation incohérent.")
+    if fpar:
+        recs.append(f"{fpar} FAIL_PARAM — paramètre <code>{{...}}</code> non défini : le sous-circuit attend un paramètre (souvent à déclarer en défaut dans la ligne <code>.SUBCKT</code>).")
     if fmis:
         recs.append(f"{fmis} FAIL_MISSING_SUBCKT — un sous-circuit appelle un autre sous-circuit non défini.")
     if ffat:
@@ -871,7 +921,7 @@ tbody tr:hover td { background: #fafbfd; }
 .status.UNKNOWN { background: #f5f5f5; color: #555; }
 .status.BROKEN_LIKELY, .status.READ_ERROR, .status.TIMEOUT, .status.EXEC_ERROR,
 .status.FAIL_SYNTAX, .status.FAIL_INCLUDE, .status.FAIL_SUBCKT, .status.FAIL_PINCOUNT,
-.status.FAIL_FATAL, .status.FAIL_OTHER, .status.FAIL_MISSING_SUBCKT { background: #ffebee; color: var(--bad); }
+.status.FAIL_FATAL, .status.FAIL_OTHER, .status.FAIL_MISSING_SUBCKT, .status.FAIL_PARAM { background: #ffebee; color: var(--bad); }
 .status.ENDS, .status.SUBCKT, .status.TABLE, .status.PARENS_FILE, .status.PARENS_LINE { background: #fff3e0; color: var(--warn); }
 
 .toolbar { display: flex; gap: .5rem; align-items: center; margin: .4rem 0 .6rem; flex-wrap: wrap; }
@@ -1598,7 +1648,7 @@ def _classify_confidence(prescan_status: str,
         return "medium"
     if batch_statuses & {"FAIL_SYNTAX", "FAIL_MISSING_SUBCKT"}:
         return "medium"
-    if batch_statuses & {"FAIL_SUBCKT", "FAIL_PINCOUNT", "FAIL_OTHER", "WARN_LOG"}:
+    if batch_statuses & {"FAIL_SUBCKT", "FAIL_PINCOUNT", "FAIL_PARAM", "FAIL_OTHER", "WARN_LOG"}:
         return "low"
     return "low"
 
