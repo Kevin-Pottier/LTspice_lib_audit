@@ -1996,6 +1996,10 @@ class AuditGUI:
         self.no_cache_var = tk.BooleanVar(value=False)
         self.keep_raw_var = tk.BooleanVar(value=False)
         self.no_report_var = tk.BooleanVar(value=False)
+        self.fix_bundle_var = tk.BooleanVar(value=False)
+        self.bundle_max_files_var = tk.IntVar(value=BUNDLE_DEFAULT_MAX_FILES)
+        self.bundle_min_conf_var = tk.StringVar(value="low")
+        self.verbose_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._load_settings()
@@ -2049,6 +2053,10 @@ class AuditGUI:
                         variable=self.keep_raw_var).grid(row=1, column=1, sticky='w', padx=4)
         ttk.Checkbutton(opts, text="Pas de rapport HTML",
                         variable=self.no_report_var).grid(row=1, column=2, sticky='w', padx=4)
+        ttk.Checkbutton(opts, text="Generer fix bundle",
+                        variable=self.fix_bundle_var).grid(row=2, column=0, sticky='w', padx=4)
+        ttk.Checkbutton(opts, text="Verbose (logs detailles)",
+                        variable=self.verbose_var).grid(row=2, column=1, sticky='w', padx=4)
 
         # Numeriques
         nums = ttk.LabelFrame(self.root, text="Reglages", padding=10)
@@ -2064,6 +2072,14 @@ class AuditGUI:
         ttk.Label(nums, text="Max subckts:").grid(row=0, column=8, sticky='w')
         ttk.Spinbox(nums, from_=0, to=999999, textvariable=self.max_subckts_var, width=8).grid(row=0, column=9, padx=(4, 0))
 
+        # Reglages bundle (ligne 2)
+        ttk.Label(nums, text="Bundle max files:").grid(row=1, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Spinbox(nums, from_=1, to=10000, textvariable=self.bundle_max_files_var, width=8).grid(row=1, column=2, padx=(4, 16), pady=(6, 0))
+        ttk.Label(nums, text="Bundle min confidence:").grid(row=1, column=3, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Combobox(nums, textvariable=self.bundle_min_conf_var,
+                     values=["high", "medium", "low", "manual_only"],
+                     state="readonly", width=12).grid(row=1, column=5, columnspan=2, padx=(4, 0), pady=(6, 0), sticky='w')
+
         # Boutons d'action
         actions = ttk.Frame(self.root, padding=(12, 8, 12, 4))
         actions.pack(fill='x')
@@ -2071,9 +2087,10 @@ class AuditGUI:
         self.start_btn.pack(side='left')
         self.stop_btn = ttk.Button(actions, text="Arreter (sauve cache)", command=self._on_stop, state='disabled')
         self.stop_btn.pack(side='left', padx=6)
-        ttk.Button(actions, text="Regenerer rapport HTML", command=self._on_report_only).pack(side='left', padx=6)
+        ttk.Button(actions, text="Regenerer rapport", command=self._on_report_only).pack(side='left', padx=6)
+        ttk.Button(actions, text="Generer bundle", command=self._on_bundle_only).pack(side='left', padx=6)
         ttk.Button(actions, text="Ouvrir rapport", command=self._open_report).pack(side='left', padx=6)
-        ttk.Button(actions, text="Ouvrir dossier sortie", command=self._open_outdir).pack(side='left', padx=6)
+        ttk.Button(actions, text="Ouvrir dossier", command=self._open_outdir).pack(side='left', padx=6)
 
         # Progression
         prog = ttk.Frame(self.root, padding=(12, 4))
@@ -2193,6 +2210,12 @@ class AuditGUI:
             a.append("--keep-raw")
         if self.no_report_var.get():
             a.append("--no-report")
+        if self.fix_bundle_var.get():
+            a.append("--fix-bundle")
+            a += ["--bundle-max-files", str(int(self.bundle_max_files_var.get() or BUNDLE_DEFAULT_MAX_FILES))]
+            a += ["--bundle-min-confidence", self.bundle_min_conf_var.get() or "low"]
+        if self.verbose_var.get():
+            a.append("--verbose")
         return a
 
     # ---- Sous-processus ----
@@ -2337,6 +2360,31 @@ class AuditGUI:
         except Exception as exc:
             messagebox.showerror("Erreur", f"{exc}")
 
+    def _on_bundle_only(self):
+        from tkinter import messagebox
+        out = self.out_var.get().strip()
+        if not out or not (Path(out) / "reports").exists():
+            messagebox.showerror("Erreur", "Pas de CSV trouves dans ce dossier de sortie.")
+            return
+        py_exe = sys.executable
+        if py_exe.lower().endswith('pythonw.exe'):
+            cand = Path(py_exe).with_name('python.exe')
+            if cand.exists():
+                py_exe = str(cand)
+        script = str(Path(__file__).resolve())
+        cmd = [py_exe, "-u", script, "--out", out, "--fix-bundle-only",
+               "--bundle-max-files", str(int(self.bundle_max_files_var.get() or BUNDLE_DEFAULT_MAX_FILES)),
+               "--bundle-min-confidence", self.bundle_min_conf_var.get() or "low"]
+        self._append_log(f"\n>>> {' '.join(cmd)}\n")
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                 encoding='utf-8', errors='replace')
+            self._append_log(res.stdout or "")
+            if res.stderr:
+                self._append_log(res.stderr)
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"{exc}")
+
     def _open_report(self):
         import webbrowser
         from tkinter import messagebox
@@ -2388,6 +2436,10 @@ class AuditGUI:
             'no_cache': bool(self.no_cache_var.get()),
             'keep_raw': bool(self.keep_raw_var.get()),
             'no_report': bool(self.no_report_var.get()),
+            'fix_bundle': bool(self.fix_bundle_var.get()),
+            'bundle_max_files': int(self.bundle_max_files_var.get() or BUNDLE_DEFAULT_MAX_FILES),
+            'bundle_min_confidence': self.bundle_min_conf_var.get() or 'low',
+            'verbose': bool(self.verbose_var.get()),
         }
         try:
             GUI_SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding='utf-8')
@@ -2416,6 +2468,10 @@ class AuditGUI:
         self.no_cache_var.set(bool(data.get('no_cache', False)))
         self.keep_raw_var.set(bool(data.get('keep_raw', False)))
         self.no_report_var.set(bool(data.get('no_report', False)))
+        self.fix_bundle_var.set(bool(data.get('fix_bundle', False)))
+        self.bundle_max_files_var.set(int(data.get('bundle_max_files', BUNDLE_DEFAULT_MAX_FILES)))
+        self.bundle_min_conf_var.set(str(data.get('bundle_min_confidence', 'low')))
+        self.verbose_var.set(bool(data.get('verbose', False)))
 
     def _on_close(self):
         self._save_settings()
@@ -2443,7 +2499,17 @@ class AuditGUI:
 # Main
 # ---------------------------------------------------------------------------
 
+def _flush_stdout() -> None:
+    """Force le line-buffering de stdout pour eviter l'effet 'freeze' en console
+    (les print restent bloques dans le buffer si stdout est redirige)."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+
+
 def main() -> int:
+    _flush_stdout()
     parser = argparse.ArgumentParser(
         description="Audit automatise de librairies LTspice third-party (parallele + cache)"
     )
@@ -2484,6 +2550,8 @@ def main() -> int:
                         choices=["high", "medium", "low", "manual_only"],
                         default="low",
                         help="Niveau de confiance minimum pour inclure un fichier (defaut low = tout sauf manual_only)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Logs detailles (rythme de progress accelere, marqueurs de phase plus bavards)")
     parser.add_argument("--group-size", type=int, default=20,
                         help="Sous-circuits regroupes par deck pour amortir le startup LTspice "
                              "(defaut 20 ; 1 = desactive). Les groupes qui echouent sont retestes individuellement.")
@@ -2540,9 +2608,13 @@ def main() -> int:
     exts = {e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower()
             for e in args.extensions.split(",") if e.strip()}
 
+    print(f"[PHASE] Listage des fichiers candidats sous {root}...")
+    t_list = time.time()
     files = list_candidate_files(root, exts)
     if args.max_files and args.max_files > 0:
         files = files[:args.max_files]
+    print(f"[PHASE] Listage termine en {time.time() - t_list:.1f}s "
+          f"({len(files)} fichier(s) trouves).")
 
     print(f"[INFO] Racine          : {root}")
     print(f"[INFO] Sortie          : {out}")
@@ -2576,9 +2648,18 @@ def main() -> int:
     models: List[ModelInfo] = []
     file_hashes: Dict[str, str] = {}
 
+    print(f"[PHASE] Verification du cache : calcul des hashes pour {len(files)} fichier(s)...")
+    t_hash = time.time()
     to_scan: List[Path] = []
     cached_hits = 0
-    for fp in files:
+    hash_progress_every = 200 if args.verbose else 2000
+    for i, fp in enumerate(files, start=1):
+        if i % hash_progress_every == 0 or i == len(files):
+            elapsed = time.time() - t_hash
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (len(files) - i) / rate if rate > 0 else 0
+            print(f"[INFO] Hash: {i}/{len(files)} ({100*i/len(files):.0f}%) "
+                  f"- {rate:.0f} fichiers/s - ETA {fmt_eta(eta)}")
         try:
             h = file_hash(fp)
         except Exception:
@@ -2738,8 +2819,12 @@ def main() -> int:
         ))
 
     # ---- A. FILE_PARSE par fichier ----
+    print(f"[PHASE] Generation des decks FILE_PARSE ({len(summaries)} fichier(s) candidats)...")
+    t_decks_a = time.time()
     file_parse_tasks: List[dict] = []
     file_parse_cache_hits = 0
+    deck_progress_every = 200 if args.verbose else 1000
+    decks_done_a = 0
     for fs in summaries:
         if file_skip_for_batch(fs):
             continue
@@ -2750,6 +2835,10 @@ def main() -> int:
         deck_name = safe_name(fs.rel_path) + "__file_parse_test.cir"
         cir_path = decks_dir / deck_name
         cir_path.write_text(build_file_parse_test_deck(file_path), encoding="utf-8")
+        decks_done_a += 1
+        if decks_done_a % deck_progress_every == 0:
+            print(f"[INFO] Decks FILE_PARSE: {decks_done_a} ecrits "
+                  f"({time.time() - t_decks_a:.1f}s)")
         command_rows.append({
             "kind": "FILE_PARSE",
             "file_path": fs.file_path,
@@ -2776,14 +2865,24 @@ def main() -> int:
                 "keep_raw": args.keep_raw,
             })
 
+    print(f"[PHASE] FILE_PARSE termine : {decks_done_a} deck(s) ecrits en "
+          f"{time.time() - t_decks_a:.1f}s "
+          f"({file_parse_cache_hits} hit cache, {len(file_parse_tasks)} a executer).")
+
     # ---- B. SUBCKTS : cache check + groupement par fichier ----
     subs_iter = subckts
     if args.max_subckts and args.max_subckts > 0:
         subs_iter = subs_iter[:args.max_subckts]
 
+    print(f"[PHASE] Verification cache des sous-circuits ({len(subs_iter)} sous-circuit(s))...")
+    t_subs = time.time()
     non_cached_subs_per_file: Dict[str, List[SubcktInfo]] = {}
     sub_cache_hits = 0
-    for sub in subs_iter:
+    sub_cache_progress_every = 500 if args.verbose else 5000
+    for i, sub in enumerate(subs_iter, start=1):
+        if i % sub_cache_progress_every == 0 or i == len(subs_iter):
+            print(f"[INFO] Cache subckts: {i}/{len(subs_iter)} verifies "
+                  f"({sub_cache_hits} hit)")
         fs = summary_map.get(sub.file_path)
         if fs and file_skip_for_batch(fs):
             continue
@@ -2795,8 +2894,16 @@ def main() -> int:
         else:
             non_cached_subs_per_file.setdefault(sub.file_path, []).append(sub)
 
+    n_files_to_deck = len(non_cached_subs_per_file)
+    print(f"[PHASE] Verification cache subckts terminee en {time.time() - t_subs:.1f}s "
+          f"({sub_cache_hits} hit, {n_files_to_deck} fichier(s) avec subckts non-caches).")
+    print(f"[PHASE] Generation des decks SUBCKT (groupes de {group_size})...")
+    t_decks_b = time.time()
+    file_deck_progress_every = 50 if args.verbose else 500
+    decks_done_b = 0
+
     pass1_subckt_tasks: List[dict] = []
-    for file_path_str, members in non_cached_subs_per_file.items():
+    for file_idx, (file_path_str, members) in enumerate(non_cached_subs_per_file.items(), start=1):
         fs = summary_map.get(file_path_str)
         if fs is None:
             continue
@@ -2807,6 +2914,10 @@ def main() -> int:
         chunks_iter = [members[i:i + group_size]
                        for i in range(0, len(members), group_size)]
 
+        if file_idx % file_deck_progress_every == 0 or file_idx == n_files_to_deck:
+            print(f"[INFO] Decks SUBCKT: fichier {file_idx}/{n_files_to_deck} "
+                  f"- {decks_done_b} deck(s) ecrits ({time.time() - t_decks_b:.1f}s)")
+
         for chunk_idx, chunk in enumerate(chunks_iter):
             if len(chunk) == 1 or group_size <= 1:
                 sub = chunk[0]
@@ -2816,6 +2927,7 @@ def main() -> int:
                     build_subckt_test_deck(abs_file_path, sub.name, sub.pin_count),
                     encoding="utf-8"
                 )
+                decks_done_b += 1
                 command_rows.append({
                     "kind": "SUBCKT_INSTANTIATION",
                     "file_path": sub.file_path,
@@ -2849,6 +2961,7 @@ def main() -> int:
                     ),
                     encoding="utf-8"
                 )
+                decks_done_b += 1
                 command_rows.append({
                     "kind": "SUBCKT_GROUP",
                     "file_path": fs.file_path,
@@ -2876,6 +2989,8 @@ def main() -> int:
                         "file_h": file_h,
                     })
 
+    print(f"[PHASE] Generation SUBCKT terminee : {decks_done_b} deck(s) en "
+          f"{time.time() - t_decks_b:.1f}s.")
     pass1_tasks = file_parse_tasks + pass1_subckt_tasks
 
     write_csv(
