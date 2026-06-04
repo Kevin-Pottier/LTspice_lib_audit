@@ -1689,7 +1689,8 @@ def _build_bundle_manifest(data: dict) -> str:
 
 def generate_fix_bundle(out_dir: Path,
                         max_files: int = BUNDLE_DEFAULT_MAX_FILES,
-                        min_confidence: str = "low") -> Optional[Path]:
+                        min_confidence: str = "low",
+                        verbose: bool = False) -> Optional[Path]:
     """
     Genere un dossier portable {out_dir}/fix_bundle/ avec :
     - sources/   : copies des fichiers en erreur (arborescence preservee)
@@ -1749,7 +1750,19 @@ def generate_fix_bundle(out_dir: Path,
     entries: List[dict] = []
     skipped_confidence = 0
 
-    for fp in errored:
+    errored_list = sorted(errored)
+    n_errored = len(errored_list)
+    print(f"[PHASE] Construction du bundle : analyse de {n_errored} fichier(s) en erreur...")
+    t_bundle = time.time()
+    bundle_progress_every = 50 if verbose else 250
+
+    for idx_b, fp in enumerate(errored_list, start=1):
+        if idx_b % bundle_progress_every == 0 or idx_b == n_errored:
+            elapsed = time.time() - t_bundle
+            rate = idx_b / elapsed if elapsed > 0 else 0
+            eta = (n_errored - idx_b) / rate if rate > 0 else 0
+            print(f"[INFO] Bundle: {idx_b}/{n_errored} analyses "
+                  f"({len(entries)} retenus) - ETA {fmt_eta(eta)}")
         s = sm_by_path.get(fp, {})
         issues = issues_by_path.get(fp, [])
         fails = [b for b in batch_by_path.get(fp, [])
@@ -2219,25 +2232,18 @@ class AuditGUI:
         return a
 
     # ---- Sous-processus ----
-    def _on_start(self):
+    def _spawn_streaming(self, cli_args, busy_status="En cours...", op_name="Operation"):
+        """Lance le script en sous-processus NON bloquant et streame stdout vers
+        la console GUI. Reutilise par audit / rapport / bundle : evite tout freeze
+        de l'interface (le thread principal Tkinter n'attend jamais le process).
+        Retourne True si lance, False sinon."""
         import threading
         from tkinter import messagebox
 
         if self.process is not None and self.process.poll() is None:
-            messagebox.showwarning("En cours", "Un audit tourne deja.")
-            return
-
-        cli_args = self._build_cli_args()
-        if cli_args is None:
-            return
-
-        self._save_settings()
-        self.log_text.delete('1.0', 'end')
-        self.progress['value'] = 0
-        self.status_label['text'] = "Demarrage..."
-        self.start_time = time.time()
-        self.last_total = 0
-        self.last_completed = 0
+            messagebox.showwarning("En cours",
+                                   "Une operation tourne deja. Attends la fin ou clique Arreter.")
+            return False
 
         # Resoudre python.exe (eviter pythonw.exe sans stdout)
         py_exe = sys.executable
@@ -2273,14 +2279,36 @@ class AuditGUI:
         except Exception as exc:
             messagebox.showerror("Erreur", f"Impossible de lancer le sous-processus:\n{exc}")
             self.process = None
-            return
+            return False
 
+        self.current_op = op_name
+        self.status_label['text'] = busy_status
         self.start_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
 
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
         self.root.after(80, self._poll_queue)
+        return True
+
+    def _on_start(self):
+        from tkinter import messagebox
+
+        if self.process is not None and self.process.poll() is None:
+            messagebox.showwarning("En cours", "Un audit tourne deja.")
+            return
+
+        cli_args = self._build_cli_args()
+        if cli_args is None:
+            return
+
+        self._save_settings()
+        self.log_text.delete('1.0', 'end')
+        self.progress['value'] = 0
+        self.start_time = time.time()
+        self.last_total = 0
+        self.last_completed = 0
+        self._spawn_streaming(cli_args, busy_status="Demarrage...", op_name="Audit")
 
     def _reader_loop(self):
         try:
@@ -2313,14 +2341,15 @@ class AuditGUI:
     def _on_finished(self):
         rc = self.process.poll() if self.process else None
         self.process = None
+        op = getattr(self, 'current_op', 'Operation')
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         if rc == 0:
             self.status_label['text'] = "Termine"
-            self._append_log(f"[GUI] Audit termine (exit {rc}).")
+            self._append_log(f"[GUI] {op} terminee (exit {rc}).")
         else:
             self.status_label['text'] = f"Termine (exit {rc})"
-            self._append_log(f"[GUI] Audit termine avec code {rc}.")
+            self._append_log(f"[GUI] {op} terminee avec code {rc}.")
 
     def _on_stop(self):
         import signal as _signal
@@ -2338,27 +2367,15 @@ class AuditGUI:
             messagebox.showerror("Erreur", f"Impossible d'envoyer le signal: {exc}")
 
     def _on_report_only(self):
-        import threading
         from tkinter import messagebox
         out = self.out_var.get().strip()
         if not out or not (Path(out) / "reports").exists():
             messagebox.showerror("Erreur", "Pas de CSV trouves dans ce dossier de sortie.")
             return
-        py_exe = sys.executable
-        if py_exe.lower().endswith('pythonw.exe'):
-            cand = Path(py_exe).with_name('python.exe')
-            if cand.exists():
-                py_exe = str(cand)
-        script = str(Path(__file__).resolve())
-        cmd = [py_exe, "-u", script, "--out", out, "--report-only"]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
-                                 encoding='utf-8', errors='replace')
-            self._append_log(res.stdout or "")
-            if res.stderr:
-                self._append_log(res.stderr)
-        except Exception as exc:
-            messagebox.showerror("Erreur", f"{exc}")
+        # Streaming non bloquant : la GUI reste reactive pendant la generation
+        self._spawn_streaming(["--out", out, "--report-only"],
+                              busy_status="Generation du rapport HTML...",
+                              op_name="Rapport HTML")
 
     def _on_bundle_only(self):
         from tkinter import messagebox
@@ -2366,24 +2383,15 @@ class AuditGUI:
         if not out or not (Path(out) / "reports").exists():
             messagebox.showerror("Erreur", "Pas de CSV trouves dans ce dossier de sortie.")
             return
-        py_exe = sys.executable
-        if py_exe.lower().endswith('pythonw.exe'):
-            cand = Path(py_exe).with_name('python.exe')
-            if cand.exists():
-                py_exe = str(cand)
-        script = str(Path(__file__).resolve())
-        cmd = [py_exe, "-u", script, "--out", out, "--fix-bundle-only",
-               "--bundle-max-files", str(int(self.bundle_max_files_var.get() or BUNDLE_DEFAULT_MAX_FILES)),
-               "--bundle-min-confidence", self.bundle_min_conf_var.get() or "low"]
-        self._append_log(f"\n>>> {' '.join(cmd)}\n")
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
-                                 encoding='utf-8', errors='replace')
-            self._append_log(res.stdout or "")
-            if res.stderr:
-                self._append_log(res.stderr)
-        except Exception as exc:
-            messagebox.showerror("Erreur", f"{exc}")
+        args = ["--out", out, "--fix-bundle-only",
+                "--bundle-max-files", str(int(self.bundle_max_files_var.get() or BUNDLE_DEFAULT_MAX_FILES)),
+                "--bundle-min-confidence", self.bundle_min_conf_var.get() or "low"]
+        if self.verbose_var.get():
+            args.append("--verbose")
+        # Streaming non bloquant : evite le freeze sur les gros bundles (2000+ fichiers)
+        self._spawn_streaming(args,
+                              busy_status="Generation du fix bundle...",
+                              op_name="Fix bundle")
 
     def _open_report(self):
         import webbrowser
@@ -2584,7 +2592,8 @@ def main() -> int:
         if not (out / "reports").exists():
             print(f"[ERREUR] {out / 'reports'} introuvable. Lance d'abord un audit complet.")
             return 2
-        p = generate_fix_bundle(out, args.bundle_max_files, args.bundle_min_confidence)
+        p = generate_fix_bundle(out, args.bundle_max_files, args.bundle_min_confidence,
+                                verbose=args.verbose)
         return 0 if p else 1
 
     if not args.root:
@@ -3210,7 +3219,8 @@ def main() -> int:
 
     if args.fix_bundle:
         try:
-            generate_fix_bundle(out, args.bundle_max_files, args.bundle_min_confidence)
+            generate_fix_bundle(out, args.bundle_max_files, args.bundle_min_confidence,
+                                verbose=args.verbose)
         except Exception as exc:
             print(f"[WARN] Generation fix bundle echouee: {type(exc).__name__}: {exc}")
 
