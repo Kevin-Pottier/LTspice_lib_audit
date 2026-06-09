@@ -57,7 +57,10 @@ CSV_DIALECT = "excel"
 # Cache : on stocke par hash de fichier ce qui a ete deja calcule.
 # Bumper CACHE_VERSION si la logique de prescan / classification change.
 CACHE_FILENAME = ".audit_cache.json"
-CACHE_VERSION = 1
+CACHE_VERSION = 1  # format global du cache (batch). Bump = invalide TOUT le cache.
+# Version de la LOGIQUE de prescan. Si elle change, on invalide UNIQUEMENT le
+# cache prescan (rapide a recalculer) sans jeter le cache batch (run LTspice couteux).
+PRESCAN_LOGIC_VERSION = 3  # v3 : + detection NOT_SPICE (fichiers de documentation)
 CACHE_SAVE_EVERY = 500  # sauve le cache toutes les N taches batch terminees
 
 REPORT_FILENAME = "report.html"
@@ -200,6 +203,27 @@ def parse_subckt_signature(rest: str) -> Tuple[List[str], List[str]]:
     return pins, params
 
 
+def build_logical_lines(lines: List[str]) -> List[Tuple[int, str]]:
+    """
+    Joint les continuations SPICE ('+' en debut de ligne) en lignes LOGIQUES.
+    Retourne [(numero_ligne_de_depart, texte_logique_complet)].
+
+    Indispensable pour ne pas compter a tort des parentheses "desequilibrees"
+    sur une expression comportementale etalee sur plusieurs lignes, ex :
+        G_IO a b VALUE={IF(abs(V(x))<50m , V(y)*GB*(
+        +abs(V(x))/3m ) , V(y)*GB*( 50m/3m ) )}
+    qui est en realite parfaitement equilibree une fois jointe.
+    """
+    logical: List[Tuple[int, str]] = []
+    for idx, line in enumerate(lines, start=1):
+        if line.lstrip().startswith("+") and logical:
+            prev_no, prev_text = logical[-1]
+            logical[-1] = (prev_no, prev_text + " " + line.lstrip()[1:])
+        else:
+            logical.append((idx, line))
+    return logical
+
+
 def file_hash(path: Path) -> str:
     """Hash rapide du contenu (BLAKE2b 128 bits, plus rapide que SHA-1)."""
     h = hashlib.blake2b(digest_size=16)
@@ -230,7 +254,8 @@ def write_csv(path: Path, rows: Iterable[dict], fieldnames: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def load_cache(cache_path: Path) -> dict:
-    empty = {"version": CACHE_VERSION, "files": {}, "batch": {}}
+    empty = {"version": CACHE_VERSION, "prescan_logic_version": PRESCAN_LOGIC_VERSION,
+             "files": {}, "batch": {}}
     if not cache_path.exists():
         return empty
     try:
@@ -241,6 +266,14 @@ def load_cache(cache_path: Path) -> dict:
             return empty
         data.setdefault("files", {})
         data.setdefault("batch", {})
+        # Invalide UNIQUEMENT le cache prescan si la logique a change (le cache
+        # batch, couteux a regenerer, est conserve puis migre).
+        if data.get("prescan_logic_version") != PRESCAN_LOGIC_VERSION:
+            n = len(data.get("files", {}))
+            print(f"[INFO] Logique de prescan mise a jour : {n} resultat(s) prescan "
+                  f"recalcules (cache batch conserve).")
+            data["files"] = {}
+            data["prescan_logic_version"] = PRESCAN_LOGIC_VERSION
         return data
     except Exception as exc:
         print(f"[WARN] Cache illisible ({exc}), repart a zero.")
@@ -261,6 +294,24 @@ def save_cache(cache_path: Path, cache: dict) -> None:
 # Prescan (utilisable en main process et en worker)
 # ---------------------------------------------------------------------------
 
+# Directives SPICE : leur presence distingue un vrai fichier de librairie d'un
+# fichier de documentation (README, "how to use", guide etudiant, etc.).
+SPICE_DIRECTIVE_RE = re.compile(
+    r'^\s*\.(model|subckt|ends|param|lib|inc|include|func|global|tran|ac|dc'
+    r'|op|end|meas|step|options?|temp|nodeset|ic)\b',
+    re.IGNORECASE,
+)
+
+
+def looks_like_spice(lines: List[str]) -> bool:
+    """True si le fichier contient au moins une directive SPICE.
+    Un .txt de pure documentation (prose) en est depourvu -> NOT_SPICE."""
+    for raw in lines:
+        if SPICE_DIRECTIVE_RE.match(raw):
+            return True
+    return False
+
+
 def prescan_file(root: Path, path: Path) -> Tuple[FileSummary, List[StaticIssue], List[SubcktInfo], List[ModelInfo]]:
     raw = path.read_bytes()
     text, enc = detect_encoding(raw)
@@ -271,6 +322,18 @@ def prescan_file(root: Path, path: Path) -> Tuple[FileSummary, List[StaticIssue]
     subckts: List[SubcktInfo] = []
     models: List[ModelInfo] = []
 
+    # Fichier de documentation (pas de directive SPICE) -> NOT_SPICE, exclu des
+    # erreurs. Evite de flagger des README / guides .txt comme casses.
+    if not looks_like_spice(lines):
+        summary = FileSummary(
+            file_path=str(path), rel_path=rel_path, extension=path.suffix.lower(),
+            encoding=enc, line_count=len(lines), char_count=len(text),
+            subckt_count=0, model_count=0, include_count=0,
+            syntax_score=100, status="NOT_SPICE",
+            issues="Aucune directive SPICE (fichier de documentation ?)",
+        )
+        return summary, [], [], []
+
     include_count = 0
     subckt_open_stack: List[Tuple[str, int]] = []
     syntax_score = 100
@@ -278,7 +341,9 @@ def prescan_file(root: Path, path: Path) -> Tuple[FileSummary, List[StaticIssue]
     total_open = 0
     total_close = 0
 
-    for idx, line in enumerate(lines, start=1):
+    # Lignes LOGIQUES (continuations '+' jointes) : evite les faux positifs de
+    # parentheses sur les expressions comportementales multi-lignes.
+    for idx, line in build_logical_lines(lines):
         stripped = strip_inline_comment(line)
 
         opens, closes = count_parentheses_balance(stripped)
@@ -918,7 +983,7 @@ tbody tr:hover td { background: #fafbfd; }
 .status { padding: .1rem .5rem; border-radius: 3px; font-size: .76rem; font-weight: 600; white-space: nowrap; display: inline-block; }
 .status.OK, .status.LIKELY_OK { background: #e8f5e9; color: var(--ok); }
 .status.WARN_LOG, .status.SUSPECT { background: #fff3e0; color: var(--warn); }
-.status.UNKNOWN { background: #f5f5f5; color: #555; }
+.status.UNKNOWN, .status.NOT_SPICE { background: #f5f5f5; color: #555; }
 .status.BROKEN_LIKELY, .status.READ_ERROR, .status.TIMEOUT, .status.EXEC_ERROR,
 .status.FAIL_SYNTAX, .status.FAIL_INCLUDE, .status.FAIL_SUBCKT, .status.FAIL_PINCOUNT,
 .status.FAIL_FATAL, .status.FAIL_OTHER, .status.FAIL_MISSING_SUBCKT, .status.FAIL_PARAM { background: #ffebee; color: var(--bad); }
@@ -2079,7 +2144,7 @@ class AuditGUI:
         ttk.Label(header, text="LTspice Library Auditor",
                   font=('Segoe UI', 14, 'bold')).pack(anchor='w')
         ttk.Label(header,
-                  text="Audit parallele d'une librairie LTspice tierce. Detecte les sous-circuits cassesm,"
+                  text="Audit parallele d'une librairie LTspice tierce. Detecte les sous-circuits casses,"
                        " genere des rapports CSV et un rapport HTML interactif.",
                   foreground='#555').pack(anchor='w')
 
@@ -2682,7 +2747,8 @@ def main() -> int:
     print(f"[INFO] Timeout LTspice : {args.timeout}s")
 
     cache_path = out / CACHE_FILENAME
-    cache = {"version": CACHE_VERSION, "files": {}, "batch": {}}
+    cache = {"version": CACHE_VERSION, "prescan_logic_version": PRESCAN_LOGIC_VERSION,
+             "files": {}, "batch": {}}
     if not args.no_cache:
         cache = load_cache(cache_path)
         n_cached_f = len(cache.get("files", {}))
@@ -2836,6 +2902,8 @@ def main() -> int:
               f"(fallback individuel si echec)")
 
     def file_skip_for_batch(fs: FileSummary) -> bool:
+        if fs.status == "NOT_SPICE":  # documentation : rien a tester
+            return True
         if args.only_suspect and fs.status not in {"SUSPECT", "BROKEN_LIKELY", "READ_ERROR"}:
             return True
         if args.skip_broken_batch and fs.status in {"BROKEN_LIKELY", "READ_ERROR"}:
